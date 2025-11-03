@@ -43,6 +43,7 @@ from .jit.fp4_quantization import (
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
+    gen_cutlass_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
@@ -436,6 +437,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
@@ -465,6 +467,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        if has_sm80:
+            jit_specs.append(gen_cutlass_fused_moe_sm80_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
@@ -735,6 +739,7 @@ def detect_sm_capabilities():
     # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
     # for CUDA version and SM compatibility
     return {
+        "sm80": has_sm("compute_80", "11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),

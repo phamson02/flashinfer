@@ -24,6 +24,7 @@ from .core import (
     current_compilation_context,
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
+    sm80_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
 from .cubin_loader import get_cubin, get_meta_hash
@@ -62,6 +63,16 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = sm80_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+
+    return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
 def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
