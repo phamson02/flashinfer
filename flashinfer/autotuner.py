@@ -368,7 +368,9 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
-        self.is_tuning_mode = False
+        self.is_tuning_mode = (
+            os.environ.get("FLASHINFER_AUTOTUNER_TUNING_MODE", "0") == "1"
+        )
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
