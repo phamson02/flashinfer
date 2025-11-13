@@ -1,3 +1,4 @@
+import atexit
 import contextlib
 import copy
 import importlib
@@ -362,6 +363,7 @@ class AutoTuner:
     """
 
     _instance = None
+    _atexit_registered = False
 
     def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
         self.repeat = repeat
@@ -392,6 +394,21 @@ class AutoTuner:
 
         self._disk_cache_loaded = False
         self._cache_dirty = False
+        if self.persistent_cache_enabled:
+            AutoTuner._register_atexit_handler()
+
+    @classmethod
+    def _register_atexit_handler(cls) -> None:
+        if cls._atexit_registered:
+            return
+        atexit.register(cls._flush_cache_on_exit)
+        cls._atexit_registered = True
+
+    @staticmethod
+    def _flush_cache_on_exit() -> None:
+        instance = AutoTuner._instance
+        if instance is not None:
+            instance._persist_cache_to_disk()
 
     @classmethod
     def get(cls):
