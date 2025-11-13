@@ -94,7 +94,21 @@ struct genericMoeGemmKernelLauncher {
         "Specialized for half, float");
 #endif
 
-    static_assert(cutlass::platform::is_same<T, WeightType>::value ||
+    constexpr bool AllowMixedFp8Weights =
+#if defined(ENABLE_FP8) && defined(ENABLE_BF16)
+        (cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value ||
+         cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value) &&
+        (cutlass::platform::is_same<T, half>::value ||
+         cutlass::platform::is_same<T, __nv_bfloat16>::value);
+#elif defined(ENABLE_FP8)
+        (cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value ||
+         cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value) &&
+        cutlass::platform::is_same<T, half>::value;
+#else
+        false;
+#endif
+
+    static_assert(cutlass::platform::is_same<T, WeightType>::value || AllowMixedFp8Weights ||
                   cutlass::platform::is_same<WeightType, uint8_t>::value ||
 #if defined(ENABLE_FP4)
                   cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value ||
@@ -128,18 +142,23 @@ struct genericMoeGemmKernelLauncher {
                                               QuantOp>::TaggedOperator;
 
 #if defined(ENABLE_FP8)
-      if constexpr ((std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
+      constexpr bool ActivationIsFp8 =
+          std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+      constexpr bool WeightIsFp8 =
+          std::is_same_v<CutlassWeightType, cutlass::float_e4m3_t> ||
+          std::is_same_v<CutlassWeightType, cutlass::float_e5m2_t>;
+
+      if constexpr ((ActivationIsFp8 || WeightIsFp8) &&
                     std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>) {
-        if constexpr (std::is_same_v<T, WeightType>) {
+        if constexpr (ActivationIsFp8 && std::is_same_v<T, WeightType>) {
           TLLM_CHECK_WITH_INFO(
               inputs.scales == nullptr && inputs.biases == nullptr && inputs.alpha_scales,
               "weight_scales and biases should be nullptr and alpha_scale_ptr_array shouldn't be "
-              "nullptr for "
-              "FP8 "
-              "Ada.");
+              "nullptr for FP8 Ada.");
         } else {
           TLLM_CHECK_WITH_INFO(inputs.alpha_scales,
-                               "alpha_scale_ptr_array shouldn't be nullptr for FP8 Ada.");
+                               "alpha_scale_ptr_array shouldn't be nullptr for FP8 weights or "
+                               "activations.");
         }
         epilogue_op.alpha_ptr_array = inputs.alpha_scales;
       }
@@ -226,15 +245,6 @@ struct genericMoeGemmKernelLauncher {
   }
 };
 
-template <typename GemmOutputType, typename arch, cutlass::WeightOnlyQuantOp QuantOp,
-          typename EpilogueTag, typename ThreadblockShape, typename WarpShape, int Stages>
-struct genericMoeGemmKernelLauncher<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType, arch, QuantOp,
-                                    EpilogueTag, ThreadblockShape, WarpShape, Stages> {
-  static void call(
-      GroupedGemmInput<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType, GemmOutputType> inputs,
-      int sm_count_) {}
-};
-
 template <typename T, typename WeightType, typename GemmOutputType, typename Arch,
           typename EpilogueTag, typename ThreadblockShape, typename WarpShape, int Stages>
 static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
@@ -307,10 +317,22 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
                                   std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
                         int sm_count_) {
+#if defined(ENABLE_FP8)
+  constexpr bool use_fp8_weights =
+      std::is_same_v<WeightType, __nv_fp8_e4m3> || std::is_same_v<WeightType, __nv_fp8_e5m2>;
+#else
+  constexpr bool use_fp8_weights = false;
+#endif
+
   switch (inputs.gemm_config.stages) {
     case 2:
-      dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 2>(
-          inputs, sm_count_);
+      if constexpr (use_fp8_weights) {
+        dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 3>(
+            inputs, sm_count_);
+      } else {
+        dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 2>(
+            inputs, sm_count_);
+      }
       break;
     case 3:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 3>(
@@ -544,7 +566,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
   static constexpr auto simt_only_flag =
       std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag =
-      use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
+      use_fp8_any ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
   int const max_split_k = 1;
   int const grouped_gemm_flag = CutlassGemmConfig::GROUPED_GEMM;
   int const enable_hopper = CutlassGemmConfig::NONE;
@@ -575,7 +597,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
   int const enable_blackwell = sm >= 100 ? CutlassGemmConfig::BLACKWELL : CutlassGemmConfig::NONE;
   int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag =
-      use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
+      use_fp8_any ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp4_only_flag =
       (use_fp4 || use_wfp4afp4) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(

@@ -32,10 +32,16 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
                                                 int64_t num_rows, int64_t gemm_n, int64_t gemm_k,
                                                 int num_experts, int multi_processor_count,
                                                 cudaStream_t stream, int* kernel_occupancy) {
+  constexpr bool kFp8Weight =
+      cutlass::platform::is_same<CutlassWeightType_, cutlass::float_e4m3_t>::value ||
+      cutlass::platform::is_same<CutlassWeightType_, cutlass::float_e5m2_t>::value;
+  constexpr bool kMixedInput = !cutlass::platform::is_same<ElementType_, CutlassWeightType_>::value;
+  constexpr int kEffectiveStages = (kFp8Weight && kMixedInput && (Stages_ < 3)) ? 3 : Stages_;
+
   constexpr auto activation_type = fused_moe::EpilogueRouting<EpilogueTag>(true);
   using GemmType =
       fused_moe::Fused_Moe_Kernel_sm80<ElementType_, CutlassWeightType_, ElementType_, MaxTileM_,
-                                       TileN_, TileK_, Stages_, activation_type>;
+                                       TileN_, TileK_, kEffectiveStages, activation_type>;
 
   // make sure GPU has enough resources..
   if (kernel_occupancy != nullptr) {

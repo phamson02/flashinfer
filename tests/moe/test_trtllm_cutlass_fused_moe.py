@@ -382,6 +382,87 @@ def test_moe_fp8(
     "otype, wtype",
     [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
 )
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8,
+    reason="FP8 weight path requires SM80+",
+)
+def test_moe_fp16_activation_fp8_weight(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype
+):
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(0)
+    input_shape = (batch_size, hidden_size)
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    x = gen_tensor(input_shape, otype)
+    router_logits = gen_tensor((batch_size, num_experts), otype)
+
+    w31_weight = torch.empty(w31_shape, dtype=wtype, device="cuda")
+    w2_weight = torch.empty(w2_shape, dtype=wtype, device="cuda")
+    w31_scale_vals = torch.empty(num_experts, dtype=torch.float32, device="cuda")
+    w2_scale_vals = torch.empty(num_experts, dtype=torch.float32, device="cuda")
+    w31_dequantized = torch.empty(w31_shape, dtype=otype, device="cuda")
+    w2_dequantized = torch.empty(w2_shape, dtype=otype, device="cuda")
+
+    for expert_id in range(num_experts):
+        w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
+        w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
+
+        w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
+        w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
+
+        w31_weight.data[expert_id].copy_(w31_quant)
+        w2_weight.data[expert_id].copy_(w2_quant)
+        w31_scale_vals[expert_id] = s31.squeeze().float()
+        w2_scale_vals[expert_id] = s2.squeeze().float()
+        w31_dequantized.data[expert_id].copy_(w31_quant.to(dtype=otype) * s31)
+        w2_dequantized.data[expert_id].copy_(w2_quant.to(dtype=otype) * s2)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_dequantized,
+        w2_dequantized,
+        selected_experts,
+        routing_weights,
+    )
+    flash_output = torch.empty_like(ref_output)
+
+    quant_scales = [
+        w31_scale_vals,
+        torch.tensor(1.0, device="cuda"),
+        w2_scale_vals,
+    ]
+
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        otype,
+        quant_scales=quant_scales,
+        output=flash_output,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "otype, wtype",
+    [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
+)
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.parametrize(
     "activation_type",

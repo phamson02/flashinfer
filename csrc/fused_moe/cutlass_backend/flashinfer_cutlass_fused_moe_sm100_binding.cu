@@ -132,16 +132,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     else if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_bfloat16) {
       mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
     }
-#ifdef ENABLE_FP8
-    else if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_float8_e4m3fn) {
-      mKernelRunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3>>();
-    }
-#endif
 #endif
 
 #ifdef ENABLE_FP8
-    if (isFp8Quant()) {
-      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+    else if (mWeightDtype == dl_float8_e4m3fn) {
+      if (mActivationDtype == dl_float8_e4m3fn) {
+        mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+      } else if (mActivationDtype == dl_float16) {
+        mKernelRunner = switch_output_type<half, __nv_fp8_e4m3>(mOutputDtype);
+      }
+#ifdef ENABLE_BF16
+      else if (mActivationDtype == dl_bfloat16) {
+        mKernelRunner = switch_output_type<__nv_bfloat16, __nv_fp8_e4m3>(mOutputDtype);
+      }
+#endif
     }
 #endif
 #ifdef ENABLE_FP4
@@ -210,6 +214,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
+#ifdef ENABLE_FP8
+    if (!mKernelRunner && mWeightDtype == dl_float8_e4m3fn) {
+      if (mActivationDtype == dl_float8_e4m3fn) {
+        mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+      } else if (mActivationDtype == dl_float16) {
+        mKernelRunner = switch_output_type<half, __nv_fp8_e4m3>(mOutputDtype);
+      }
+#ifdef ENABLE_BF16
+      else if (mActivationDtype == dl_bfloat16) {
+        mKernelRunner = switch_output_type<__nv_bfloat16, __nv_fp8_e4m3>(mOutputDtype);
+      }
+#endif
+    }
+#endif
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)
           << "Could not construct fused moe op with the requested input combination Activation: "
@@ -815,32 +833,29 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       ActivationType base_activation_type = ActivationType::Swiglu) const {
     if (isFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for fp8 quantization";
-      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
-          << "Expecting 4 quant scales for fp8 quantization";
+      bool const needs_input_scale = mActivationDtype == dl_float8_e4m3fn;
+      size_t const expected_scales = needs_input_scale ? 4 : 3;
+      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), expected_scales)
+          << "Expecting " << expected_scales << " quant scales for fp8 quantization";
 
       auto const fc1_dequant = quant_scales.value()[0];
       auto const fc2_quant = quant_scales.value()[1];
       auto const fc2_dequant = quant_scales.value()[2];
-      auto const fc1_input_dequant = quant_scales.value()[3];
 
       TVM_FFI_ICHECK(fc1_dequant.GetDLTensorPtr() != nullptr)
           << "Expecting fc1_dequant to be non null";
       TVM_FFI_ICHECK(fc2_quant.GetDLTensorPtr() != nullptr) << "Expecting fc2_quant to be non null";
       TVM_FFI_ICHECK(fc2_dequant.GetDLTensorPtr() != nullptr)
           << "Expecting fc2_dequant to be non null";
-      TVM_FFI_ICHECK(fc1_input_dequant.GetDLTensorPtr() != nullptr)
-          << "Expecting fc1_input_dequant to be non null";
 
       // Check types
       CHECK_INPUT_TYPE(fc1_dequant, dl_float32);
       CHECK_INPUT_TYPE(fc2_quant, dl_float32);
       CHECK_INPUT_TYPE(fc2_dequant, dl_float32);
-      CHECK_INPUT_TYPE(fc1_input_dequant, dl_float32);
       // Check ranks
       CHECK_DIM(1, fc1_dequant);
       TVM_FFI_ICHECK_LE(fc2_quant.ndim(), 1) << "fc2 quant must be a scalar or 1-D tensor";
       CHECK_DIM(1, fc2_dequant);
-      CHECK_DIM(0, fc1_input_dequant);
       // Check shapes
       TVM_FFI_ICHECK_EQ(fc1_dequant.size(0), num_experts_on_rank)
           << "fc1 dequant size must be (num_experts_on_rank,)";
@@ -849,11 +864,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(fc2_dequant.size(0), num_experts_on_rank)
           << "fc2 dequant size must be (num_experts_on_rank,)";
 
+      float const* fc1_input_scale_ptr = nullptr;
+      if (needs_input_scale) {
+        auto const fc1_input_dequant = quant_scales.value()[3];
+        TVM_FFI_ICHECK(fc1_input_dequant.GetDLTensorPtr() != nullptr)
+            << "Expecting fc1_input_dequant to be non null";
+        CHECK_INPUT_TYPE(fc1_input_dequant, dl_float32);
+        CHECK_DIM(0, fc1_input_dequant);
+        fc1_input_scale_ptr = static_cast<float const*>(fc1_input_dequant.data_ptr());
+      }
+
       return kernels::QuantParams::FP8(static_cast<float const*>(fc1_dequant.data_ptr()),
                                        static_cast<float const*>(fc2_quant.data_ptr()),
                                        static_cast<float const*>(fc2_dequant.data_ptr()),
-                                       /* fp8 output quant scale */ nullptr,
-                                       static_cast<float const*>(fc1_input_dequant.data_ptr()),
+                                       /* fp8 output quant scale */ nullptr, fc1_input_scale_ptr,
                                        fc2_quant.ndim() == 1);
     } else if (isWMxfp4AFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1118,8 +1142,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   bool isFp8Quant() const {
-    return !mUseDeepSeekFP8BlockScaling && mActivationDtype == dl_float8_e4m3fn &&
-           mWeightDtype == dl_float8_e4m3fn;
+    return (mWeightDtype == dl_float8_e4m3fn) && !mUseDeepSeekFP8BlockScaling;
   }
 
   bool isNvfp4Quant() const {

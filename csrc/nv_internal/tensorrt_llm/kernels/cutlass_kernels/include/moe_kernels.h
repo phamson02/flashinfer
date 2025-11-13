@@ -540,18 +540,27 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #endif
 
 #if defined(ENABLE_FP8)
+  static constexpr bool use_fp8_activation =
+      std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+  static constexpr bool use_fp8_weights =
+      std::is_same_v<WeightType, __nv_fp8_e4m3> || std::is_same_v<WeightType, __nv_fp8_e5m2>;
   static constexpr bool use_fp8 =
-      (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
-      !std::is_same_v<WeightType, cutlass::uint4b_t>;
+      use_fp8_activation && !std::is_same_v<WeightType, cutlass::uint4b_t>;
+  static constexpr bool use_fp8_any = use_fp8_activation || use_fp8_weights;
   static constexpr bool use_w4afp8 =
-      std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
+      std::is_same_v<WeightType, cutlass::uint4b_t> && use_fp8_activation;
+  static constexpr bool fp8_scales_required = use_fp8_weights;
   static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>,
                 "Current logic requires backbone type to be >=16-bits");
   static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>,
                 "Current logic requires output type to be >=16-bits");
 #else
+  static constexpr bool use_fp8_activation = false;
+  static constexpr bool use_fp8_weights = false;
   static constexpr bool use_fp8 = false;
+  static constexpr bool use_fp8_any = false;
   static constexpr bool use_w4afp8 = false;
+  static constexpr bool fp8_scales_required = false;
 #endif
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 #if defined(ENABLE_FP4)
@@ -840,7 +849,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     // We just check if its supported because we need to know when calculating workspace size
     return ((moe_gemm_runner_.supportsTmaWarpSpecialized() &&
              !std::is_same_v<T, UnfusedGemmOutputType>) ||
-            use_fp8);
+            use_fp8_activation);
   }
 
   bool mayHaveFinalizeFused() const {
