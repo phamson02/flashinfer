@@ -1084,6 +1084,28 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
   return alpha_scale_ptr_array;
 }
 
+inline float const** clearFP8AlphaScalePtrArray(float const** alpha_scale_ptr_array,
+                                                int64_t num_experts_per_node,
+                                                cudaStream_t stream) {
+  if (alpha_scale_ptr_array) {
+    size_t const bytes = sizeof(float*) * num_experts_per_node;
+    check_cuda_error(cudaMemsetAsync(const_cast<float const**>(alpha_scale_ptr_array), 0, bytes,
+                                     stream));
+  }
+  return alpha_scale_ptr_array;
+}
+
+inline float const** assignFP8AlphaScalePtrArray(float const** alpha_scale_ptr_array,
+                                                 int64_t num_experts_per_node,
+                                                 float const* fp8_dequant, cudaStream_t stream) {
+  auto* populated = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                                           fp8_dequant, stream);
+  if (populated) {
+    return populated;
+  }
+  return clearFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node, stream);
+}
+
 template <class BSConfig>
 __device__ void setupFP4BlockScalingFactors(
     TmaWarpSpecializedGroupedGemmInput& layout_info, int expert, int gemm_m, int gemm_n, int gemm_k,
@@ -2618,8 +2640,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
   size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
   // lora related
-  size_t const lora_input_size =
-      (use_lora && use_fp8) ? std::max(permuted_elems, interbuf_elems) * sizeof(ScaleBiasType) : 0;
+  size_t const lora_input_size = (use_lora && use_fp8_activation)
+                                     ? std::max(permuted_elems, interbuf_elems) *
+                                           sizeof(ScaleBiasType)
+                                     : 0;
   size_t const lora_fc1_result_size =
       use_lora ? (is_gated_activation ? 2 * interbuf_elems * sizeof(ScaleBiasType)
                                       : interbuf_elems * sizeof(ScaleBiasType))
@@ -2776,7 +2800,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
       gemm1_using_tma_ws && (mayHaveDifferentGEMMOutputType() || is_gated_activation);
   // We always use fused path if we can
   bool const non_tma_ws_has_glu = !gemm1_using_fused_moe && is_gated_activation;
-  bool const has_glu_inter_result = tma_ws_has_glu || non_tma_ws_has_glu || use_fp8;
+  bool const has_glu_inter_result = tma_ws_has_glu || non_tma_ws_has_glu || use_fp8_activation;
 
   // Always same value, but overlapped with either fc1_result_ or fc2_result_
   permuted_data_ = getWsPtr(T{}, "overlapped_gemm1_gemm2_inputs");
@@ -2836,7 +2860,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
     lora_fc1_result_ = getWsPtr(ScaleBiasType{}, "lora_fc1_result");
     lora_add_bias_ = getWsPtr(ScaleBiasType{}, "lora_add_bias");
     lora_fc2_result_ = getWsPtr(ScaleBiasType{}, "lora_fc2_result");
-    TLLM_CHECK_WITH_INFO(!use_fp8 || lora_input_ != nullptr,
+    TLLM_CHECK_WITH_INFO(!use_fp8_activation || lora_input_ != nullptr,
                          "LoRA input must not be nullptr if FP8 is enabled");
     TLLM_CHECK(lora_fc1_result_ != nullptr);
     TLLM_CHECK(lora_add_bias_ != nullptr);
@@ -3002,6 +3026,17 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK(use_fp4);
   }
 
+  bool const needs_fp8_activation_scales = use_fp8_activation && !use_w4afp8;
+  bool const has_weight_fp8_scales = fp8_scales_required && (fc1_fp8_dequant != nullptr);
+  if (needs_fp8_activation_scales || has_weight_fp8_scales) {
+    alpha_scale_ptr_array = assignFP8AlphaScalePtrArray(alpha_scale_ptr_array,
+                                                        num_experts_per_node, fc1_fp8_dequant,
+                                                        stream);
+  } else {
+    alpha_scale_ptr_array =
+        clearFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node, stream);
+  }
+
   if (using_tma_ws_gemm1) {
     TLLM_CHECK(config.is_tma_warp_specialized);
     TLLM_CHECK(!use_ampere_activation_fusion);
@@ -3016,10 +3051,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     auto tma_ws_input = tma_ws_input_template;
 
-    if (use_w4afp8) {
-      alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                     quant_params.groupwise.fc1.alpha, stream);
-    }
+  if (use_w4afp8) {
+    alpha_scale_ptr_array =
+        assignFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node,
+                                    quant_params.groupwise.fc1.alpha, stream);
+  }
 
     auto universal_input =
         GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
@@ -3047,11 +3083,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     // TODO: when bias_is_broadcast is false, fuse bias to gemm
     using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
-    bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
-                                    : use_wfp4afp8
-                                        ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
-                                    : use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale
-                                              : false;
+    bool use_per_expert_act_scale =
+        use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
+        : use_wfp4afp8
+            ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
+        : use_fp8_activation ? quant_params.fp8.fc2_use_per_expert_act_scale
+                             : false;
 
     doActivation<GatedActOutputType, UnfusedGemmOutputType>(
         reinterpret_cast<GatedActOutputType*>(output),
@@ -3061,13 +3098,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc2_fp4_act_flat, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
-  } else if (use_fp8) {
+  } else if (use_fp8_activation) {
     TLLM_CHECK(!use_ampere_activation_fusion);
     TLLM_CHECK(!config.is_tma_warp_specialized);
     TLLM_CHECK(!use_block_scaling);
 
-    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                   quant_params.fp8.dequant_fc1, stream);
+    alpha_scale_ptr_array =
+        assignFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node,
+                                    quant_params.fp8.dequant_fc1, stream);
 
     auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
         input,
@@ -3091,7 +3129,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         config};
     gemm_runner.moeGemm(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
-    bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
+    bool use_per_expert_act_scale =
+        use_fp8_activation ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
     doActivation<T, UnfusedGemmOutputType>(
         output, static_cast<UnfusedGemmOutputType const*>(intermediate_result), fc2_fp8_quant,
         fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
@@ -3104,8 +3143,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK(!config.is_tma_warp_specialized);
     TLLM_CHECK(!use_block_scaling);
     if (use_w4afp8) {
-      alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                     quant_params.groupwise.fc1.alpha, stream);
+      alpha_scale_ptr_array =
+          assignFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node,
+                                      quant_params.groupwise.fc1.alpha, stream);
     }
     auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
         input,
@@ -3141,8 +3181,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                          "Input and output buffers are overlapping");
     TLLM_CHECK(!use_block_scaling);
     if (use_w4afp8) {
-      alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                     quant_params.groupwise.fc1.alpha, stream);
+      alpha_scale_ptr_array =
+          assignFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node,
+                                      quant_params.groupwise.fc1.alpha, stream);
     }
     // Run the GEMM with activation function overridden with `Identity`, we do the activation
     // separately
@@ -3228,6 +3269,17 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     return;
   }
 
+  bool const needs_fp8_activation_scales = use_fp8_activation && !use_w4afp8;
+  bool const has_weight_fp8_scales = fp8_scales_required && (fc2_fp8_dequant != nullptr);
+  if (needs_fp8_activation_scales || has_weight_fp8_scales) {
+    alpha_scale_ptr_array = assignFP8AlphaScalePtrArray(alpha_scale_ptr_array,
+                                                        num_experts_per_node, fc2_fp8_dequant,
+                                                        stream);
+  } else {
+    alpha_scale_ptr_array =
+        clearFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node, stream);
+  }
+
   TmaWarpSpecializedGroupedGemmInput tma_ws_input{};
   if (using_tma_ws_gemm2) {
     tma_ws_input = tma_ws_input_template;
@@ -3241,16 +3293,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
       check_cuda_error(cudaMemsetAsync(
           final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
     }
-  } else if (use_fp8) {
-    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                   fc2_fp8_dequant, stream);
   }
   if (use_w4afp8) {
-    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                                   quant_params.groupwise.fc2.alpha, stream);
+    alpha_scale_ptr_array =
+        assignFP8AlphaScalePtrArray(alpha_scale_ptr_array, num_experts_per_node,
+                                    quant_params.groupwise.fc2.alpha, stream);
   }
 
-  bool fuse_lora_bias = use_lora && !(use_fp8 || using_tma_ws_gemm2);
+  bool fuse_lora_bias = use_lora && !(use_fp8_activation || using_tma_ws_gemm2);
   // Note: expanded_num_rows, to check this value, it's greater than num_rows * num_experts_per_node
   auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
       input,
@@ -3293,7 +3343,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
   }
 
-  bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
+  bool has_different_output_type_ampere =
+      (use_w4afp8 || use_fp8_activation) && !using_tma_ws_gemm2;
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
@@ -3443,7 +3494,7 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   }
 
   ScaleBiasType* input{};
-  if constexpr (use_fp8) {
+  if constexpr (use_fp8_activation) {
     TLLM_CHECK(lora_input_);
     bool const scale_is_dequant = true;
     dequantFP8<ScaleBiasType, T>(lora_input_, permuted_data_, num_valid_tokens_ptr, hidden_size,
@@ -3505,7 +3556,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   int num_reqs = lora_params.num_reqs;
 
   ScaleBiasType* input{};
-  if constexpr (use_fp8) {
+  if constexpr (use_fp8_activation) {
     TLLM_CHECK(lora_input_);
     bool const scale_is_dequant = false;
     dequantFP8(lora_input_, fc1_result_, num_valid_tokens_ptr, inter_size, num_tokens,
@@ -3547,8 +3598,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
-  static constexpr bool fp8_scales_required = std::is_same<WeightType, __nv_fp8_e4m3>::value ||
-                                              std::is_same<WeightType, __nv_fp8_e5m2>::value;
 
   auto const* input_activations = static_cast<InputType const*>(input_activations_void);
   auto const* input_sf =
@@ -3652,16 +3701,20 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
         "FP8 scales are provided for integer quantization");
   } else if (fp8_scales_required && !use_deepseek_fp8_block_scale) {
-    TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
-                         "FP8 scales expected but dequant scale for FC1 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
+    bool const has_explicit_fp8_scales =
+        fc1_fp8_dequant != nullptr || fc2_fp8_quant != nullptr || fc2_fp8_dequant != nullptr;
+    if (has_explicit_fp8_scales) {
+      TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
+                           "FP8 scales expected but dequant scale for FC1 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
 
-    TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
-                         "Integer scales are provided for FP8 quantization");
-  } else if (use_lora && use_fp8) {
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for FP8 quantization");
+    }
+  } else if (use_lora && use_fp8_activation) {
     TLLM_CHECK_WITH_INFO(input_fp8_dequant != nullptr,
                          "FP8 scales expected but quant scale for input is a null pointer");
   } else {
@@ -3889,11 +3942,11 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
   auto alpha_scale_flat1 = use_fp4        ? quant_params.fp4.fc1.global_scale
                            : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc1.global_scale
-                           : use_fp8      ? fp8_dequant1
+                           : use_fp8_any  ? fp8_dequant1
                                           : nullptr;
   auto alpha_scale_flat2 = use_fp4        ? quant_params.fp4.fc2.global_scale
                            : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
-                           : use_fp8      ? fp8_dequant2
+                           : use_fp8_any  ? fp8_dequant2
                                           : nullptr;
   if (!alpha_scale_flat1 && !alpha_scale_flat2) {
     layout_info1.alpha_scale_ptr_array = nullptr;

@@ -36,6 +36,39 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 
+def dequantize_rtne_fp8_to_fp16(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float8_e4m3fn
+    bits = x.view(torch.uint8).to(torch.int32)
+    sign = (bits >> 7) & 0x1
+    exp = (bits >> 3) & 0xF
+    mant = bits & 0x7
+    half_bits = (((sign << 15) | (exp << 10) | (mant << 7))).to(torch.uint16)
+    return half_bits.view(torch.float16)
+
+
+def quantize_fp16_to_rtne_fp8(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float16
+    bits16 = x.view(torch.uint16)
+    bits32 = bits16.to(torch.int32)
+    sign = (bits32 >> 15) & 0x1
+    exp = (bits32 >> 10) & 0x1F
+    mant = bits32 & 0x3FF
+
+    mant_hi = (mant >> 7) & 0x7
+    mant_lo = mant & 0x7F
+    round_up = (mant_lo > 0x40) | ((mant_lo == 0x40) & ((mant_hi & 0x1) == 0x1))
+    mant_hi = mant_hi + round_up.to(torch.int32)
+    exp = exp + ((mant_hi >> 3) & 0x1)
+    mant_fp8 = mant_hi & 0x7
+    exp_fp8 = torch.clamp(exp, 0, 0xF)
+
+    bits8 = (((sign << 7) | (exp_fp8 << 3) | mant_fp8)).to(torch.uint8)
+
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    out.view(torch.uint8).copy_(bits8)
+    return out
+
+
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
     fp8_traits_max = FLOAT8_E4M3_MAX
     fp8_traits_min = -FLOAT8_E4M3_MAX
@@ -465,6 +498,73 @@ def test_moe_fp8(
         quant_scales=quant_scales,
         output=flash_output,
     )
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "otype, wtype",
+    [(torch.float16, torch.float8_e4m3fn)],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8,
+    reason="FP8 weight path requires SM80+",
+)
+def test_moe_fp16_activation_fp8_weight(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype
+):
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(0)
+    input_shape = (batch_size, hidden_size)
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    x = gen_tensor(input_shape, otype)
+    router_logits = gen_tensor((batch_size, num_experts), otype)
+
+    w31_weight = torch.empty(w31_shape, dtype=wtype, device="cuda")
+    w2_weight = torch.empty(w2_shape, dtype=wtype, device="cuda")
+
+    for expert_id in range(num_experts):
+        w31 = torch.clamp(gen_tensor(w31_shape[1:], otype, scale=0.1), -1.875, 1.875)
+        w2 = torch.clamp(gen_tensor(w2_shape[1:], otype, scale=0.09), -1.875, 1.875)
+
+        w31_rtne = quantize_fp16_to_rtne_fp8(w31)
+        w2_rtne = quantize_fp16_to_rtne_fp8(w2)
+
+        w31_weight.data[expert_id].copy_(w31_rtne)
+        w2_weight.data[expert_id].copy_(w2_rtne)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        dequantize_rtne_fp8_to_fp16(w31_weight),
+        dequantize_rtne_fp8_to_fp16(w2_weight),
+        selected_experts,
+        routing_weights,
+    )
+    flash_output = torch.empty_like(ref_output)
+
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        otype,
+        quant_scales=None,
+        output=flash_output,
+    )
+
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
