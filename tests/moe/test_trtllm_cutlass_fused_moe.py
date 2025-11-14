@@ -42,7 +42,7 @@ def dequantize_rtne_fp8_to_fp16(x: torch.Tensor) -> torch.Tensor:
     sign = (bits >> 7) & 0x1
     exp = (bits >> 3) & 0xF
     mant = bits & 0x7
-    half_bits = (((sign << 15) | (exp << 10) | (mant << 7))).to(torch.uint16)
+    half_bits = ((sign << 15) | (exp << 10) | (mant << 7)).to(torch.uint16)
     return half_bits.view(torch.float16)
 
 
@@ -62,7 +62,7 @@ def quantize_fp16_to_rtne_fp8(x: torch.Tensor) -> torch.Tensor:
     mant_fp8 = mant_hi & 0x7
     exp_fp8 = torch.clamp(exp, 0, 0xF)
 
-    bits8 = (((sign << 7) | (exp_fp8 << 3) | mant_fp8)).to(torch.uint8)
+    bits8 = ((sign << 7) | (exp_fp8 << 3) | mant_fp8).to(torch.uint8)
 
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     out.view(torch.uint8).copy_(bits8)
@@ -193,6 +193,121 @@ def compute_routing(
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     routing_weights = routing_weights.float()
     return routing_weights, selected_experts
+
+
+def reconstruct_fp16_from_dual_fp8(
+    upper: torch.Tensor, lower: torch.Tensor
+) -> torch.Tensor:
+    """Reconstruct FP16 from NestedFP dual FP8 encoding (matches kernel logic).
+
+    This implements the same reconstruction as the CUDA kernel.
+    """
+    upper_u8 = upper.view(torch.uint8)
+    lower_u8 = lower.view(torch.uint8)
+
+    s = upper_u8 & 0x80
+    sub = (lower_u8 & 0x80) >> 7
+    packed_upper = ((upper_u8 - sub) >> 1) & 0x3F
+    packed_upper |= s
+
+    pu_i32 = packed_upper.to(torch.int32)
+    raw_i32 = (pu_i32 << 8) | lower_u8.to(torch.int32)
+    raw = raw_i32.to(torch.uint16)
+    return raw.view(torch.float16)
+
+
+def pack_fp16_to_dual_fp8(
+    fp16_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack FP16 weights into NestedFP dual FP8 encoding expected by the dual-weight kernel.
+
+    The kernel applies this reconstruction:
+      s = upper & 0x80  (sign bit)
+      sub = (lower & 0x80) >> 7  (bias from lower MSB)
+      upper_recon = ((upper - sub) >> 1) & 0x3F | s
+      fp16 = (upper_recon << 8) | lower
+
+    So we need to invert this encoding.
+    """
+    raw = fp16_tensor.view(torch.int16)
+    lo = raw & 0x00FF
+    hi = (raw >> 8) & 0x00FF
+
+    # Encode: compute upper byte such that kernel reconstruction gives back hi
+    # Kernel does: hi_recon = ((upper - sub) >> 1) & 0x3F | sign
+    # So: (upper - sub) >> 1 = hi & 0x3F
+    # upper - sub = (hi & 0x3F) << 1
+    # upper = ((hi & 0x3F) << 1) + sub
+    sub = (lo >> 7) & 0x1
+    upper = ((hi & 0x80) | (((hi & 0x3F) << 1) + sub)) & 0xFF
+
+    upper_bytes = upper.to(torch.uint8)
+    lower_bytes = lo.to(torch.uint8)
+    upper_fp8 = upper_bytes.view(torch.float8_e4m3fn)
+    lower_fp8 = lower_bytes.view(torch.float8_e4m3fn)
+    return upper_fp8, lower_fp8
+
+
+def moe_reference_swiglu(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    """Compute a simple Swiglu MoE reference on CPU/GPU using reconstructed FP16 weights."""
+    batch, hidden = x.shape
+    inter2 = fc1_weights.shape[1]
+    inter = inter2 // 2
+    out = torch.zeros(batch, hidden, device=x.device, dtype=x.dtype)
+
+    for b in range(batch):
+        for j in range(selected_experts.shape[1]):
+            eid = selected_experts[b, j].item()
+            w3 = fc1_weights[eid, :inter, :]
+            w1 = fc1_weights[eid, inter:, :]
+            w2 = fc2_weights[eid]
+            act = F.silu(x[b] @ w1.T) * (x[b] @ w3.T)
+            out[b] += routing_weights[b, j] * (act @ w2.T)
+    return out
+
+
+def moe_reference_non_gated(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    activation_type: ActivationType,
+) -> torch.Tensor:
+    """Compute a non-gated MoE reference on CPU/GPU using reconstructed FP16 weights.
+
+    For non-gated activations (Silu, Relu, Gelu, Identity), the computation is:
+    output = sum_k(routing_weight_k * activation(x @ W1_k.T) @ W2_k.T)
+    """
+    batch, hidden = x.shape
+    out = torch.zeros(batch, hidden, device=x.device, dtype=x.dtype)
+
+    # Select activation function
+    if activation_type == ActivationType.Silu:
+        act_fn = F.silu
+    elif activation_type == ActivationType.Relu:
+        act_fn = F.relu
+    elif activation_type == ActivationType.Gelu:
+        act_fn = F.gelu
+    elif activation_type == ActivationType.Identity:
+        act_fn = lambda x: x
+    else:
+        raise ValueError(f"Unsupported non-gated activation type: {activation_type}")
+
+    for b in range(batch):
+        for j in range(selected_experts.shape[1]):
+            eid = selected_experts[b, j].item()
+            w1 = fc1_weights[eid]  # [intermediate_size, hidden_size]
+            w2 = fc2_weights[eid]  # [hidden_size, intermediate_size]
+            act = act_fn(x[b] @ w1.T)
+            out[b] += routing_weights[b, j] * (act @ w2.T)
+    return out
 
 
 def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
@@ -357,14 +472,27 @@ def compute_with_experts(
 # Test configurations
 BATCH_SIZES = [
     1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
 ]
 HIDDEN_SIZES = [
-    128,
+    1024,
 ]
-NUM_EXPERTS = [2]
+NUM_EXPERTS = [8]
 TOP_K_VALUES = [2]
 INTERMEDIATE_SIZES = [
-    128,
+    1024,
 ]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
@@ -415,6 +543,156 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8
+    or torch.cuda.get_device_capability()[0] > 8
+    or torch.cuda.get_device_capability()[1] > 0,
+    reason="Implement for SM80",
+)
+def test_dual_weight_fused_moe_matches_single_weight(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+):
+    """Test that dual-weight MoE matches single-weight"""
+    torch.manual_seed(0)
+    x = gen_tensor((batch_size, hidden_size), torch.float16)
+    router_logits = gen_tensor((batch_size, num_experts), torch.float16)
+
+    # Create FP8 weights properly using RTNE quantization (same as test_moe_fp16_activation_fp8_weight)
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    w31_fp16 = gen_tensor(w31_shape, torch.float16, scale=0.1)
+    w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+
+    # Pack FP16 weights into dual FP8 upper/lower encoding that the kernel reconstructs.
+    fc1_upper_fp8, fc1_lower_fp8 = pack_fp16_to_dual_fp8(w31_fp16)
+    fc2_upper_fp8, fc2_lower_fp8 = pack_fp16_to_dual_fp8(w2_fp16)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Reconstruct FP16 weights from dual FP8 to use in reference Swiglu
+    w31_reconstructed = reconstruct_fp16_from_dual_fp8(fc1_upper_fp8, fc1_lower_fp8)
+    w2_reconstructed = reconstruct_fp16_from_dual_fp8(fc2_upper_fp8, fc2_lower_fp8)
+
+    # Compute reference output using reconstructed weights
+    base_output_buffer = moe_reference_swiglu(
+        x,
+        w31_reconstructed,
+        w2_reconstructed,
+        routing_weights,
+        selected_experts.to(torch.int32),
+    )
+    dual_output_buffer = torch.empty_like(base_output_buffer)
+
+    dual_output = fused_moe.cutlass_dual_weight_fused_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        fc1_upper_fp8,
+        fc1_lower_fp8,
+        fc2_upper_fp8,
+        fc2_lower_fp8,
+        output=dual_output_buffer,
+    )
+
+    torch.testing.assert_close(
+        base_output_buffer, dual_output_buffer, rtol=1e-1, atol=1e-1
+    )
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        ActivationType.Silu,
+        ActivationType.Relu,
+        ActivationType.Gelu,
+        ActivationType.Identity,
+    ],
+    ids=["silu", "relu", "gelu", "identity"],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8
+    or torch.cuda.get_device_capability()[0] > 8
+    or torch.cuda.get_device_capability()[1] > 0,
+    reason="Implemented for SM80",
+)
+def test_dual_weight_fused_moe_non_gated(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    activation_type,
+):
+    """Test that dual-weight MoE with non-gated activations works correctly.
+
+    Non-gated activations (Silu, Relu, Gelu, Identity) use:
+    - FC1 weights: [num_experts, intermediate_size, hidden_size] (not 2*intermediate_size)
+    - Computation: activation(x @ W1.T) @ W2.T
+    """
+    torch.manual_seed(0)
+    x = gen_tensor((batch_size, hidden_size), torch.float16)
+    router_logits = gen_tensor((batch_size, num_experts), torch.float16)
+
+    # For non-gated activations, FC1 output is intermediate_size (not 2*intermediate_size)
+    w1_shape = (num_experts, intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    w1_fp16 = gen_tensor(w1_shape, torch.float16, scale=0.1)
+    w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+
+    # Pack FP16 weights into dual FP8 upper/lower encoding that the kernel reconstructs.
+    fc1_upper_fp8, fc1_lower_fp8 = pack_fp16_to_dual_fp8(w1_fp16)
+    fc2_upper_fp8, fc2_lower_fp8 = pack_fp16_to_dual_fp8(w2_fp16)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Reconstruct FP16 weights from dual FP8 to use in reference
+    w1_reconstructed = reconstruct_fp16_from_dual_fp8(fc1_upper_fp8, fc1_lower_fp8)
+    w2_reconstructed = reconstruct_fp16_from_dual_fp8(fc2_upper_fp8, fc2_lower_fp8)
+
+    # Compute reference output using reconstructed weights and non-gated activation
+    base_output_buffer = moe_reference_non_gated(
+        x,
+        w1_reconstructed,
+        w2_reconstructed,
+        routing_weights,
+        selected_experts.to(torch.int32),
+        activation_type,
+    )
+    dual_output_buffer = torch.empty_like(base_output_buffer)
+
+    dual_output = fused_moe.cutlass_dual_weight_fused_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        fc1_upper_fp8,
+        fc1_lower_fp8,
+        fc2_upper_fp8,
+        fc2_lower_fp8,
+        output=dual_output_buffer,
+        activation_type=activation_type,
+    )
+
+    torch.testing.assert_close(
+        base_output_buffer, dual_output_buffer, rtol=1e-1, atol=1e-1
+    )
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)

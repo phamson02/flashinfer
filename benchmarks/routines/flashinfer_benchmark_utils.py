@@ -129,6 +129,7 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
+        "cutlass_dual_weight_fused_moe",
     ],
     "norm": [
         "rmsnorm",
@@ -315,7 +316,7 @@ routine_cc_to_supported_backends = {
     },
     "cutlass_fused_moe": {
         "7.5": [],
-        "8.0": [],
+        "8.0": ["cutlass"],
         "8.6": [],
         "8.9": [],
         "9.0": [],
@@ -415,6 +416,16 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+    },
+    "cutlass_dual_weight_fused_moe": {
+        "7.5": [],
+        "8.0": ["cutlass"],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": [],
+        "10.3": [],
+        "12.0": [],
     },
 }
 

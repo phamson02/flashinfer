@@ -34,6 +34,7 @@ from ..jit import (
     setup_cubin_loader,
 )
 from ..jit.fused_moe import (
+    gen_cutlass_dual_weight_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -928,6 +929,390 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+    )
+
+
+@functools.cache
+def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
+    module = gen_cutlass_dual_weight_fused_moe_sm80_module(
+        use_fast_build
+    ).build_and_load()
+
+    class DualWeightMoERunner(TunableRunner):
+        runner_dict: Dict[Tuple[torch.dtype, torch.dtype, torch.dtype], Any] = dict()
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    (0,),
+                    (0,),
+                    get_last_power_of_2_num_tokens_buckets(8192),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
+                ),
+            )
+        )
+
+        def __init__(
+            self,
+            x_dtype: torch.dtype,
+            weight_dtype: torch.dtype,
+            output_dtype: torch.dtype,
+            top_k: int,
+            tp_size: int,
+            tp_rank: int,
+            ep_size: int,
+            ep_rank: int,
+            cluster_size: int,
+            cluster_rank: int,
+            enable_alltoall: bool,
+            activation_type: ActivationType,
+        ):
+            self.top_k = top_k
+            self.tp_size = tp_size
+            self.tp_rank = tp_rank
+            self.ep_size = ep_size
+            self.ep_rank = ep_rank
+            self.cluster_size = cluster_size
+            self.cluster_rank = cluster_rank
+            self.enable_alltoall = enable_alltoall
+            instance_key = (
+                x_dtype,
+                weight_dtype,
+                output_dtype,
+            )
+            self.activation_type = activation_type
+
+            if instance_key not in DualWeightMoERunner.runner_dict:
+                DualWeightMoERunner.runner_dict[instance_key] = module.init(
+                    x_dtype,
+                    weight_dtype,
+                    output_dtype,
+                )
+
+            self.fused_moe_runner = DualWeightMoERunner.runner_dict[instance_key]
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            del inputs, profile
+            return list(range(self.fused_moe_runner.get_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (
+                x,
+                fc1_upper,
+                fc1_lower,
+                fc2_upper,
+                fc2_lower,
+            ) = inputs
+            self.fused_moe_runner.run_gemm_profile_dual_weight(
+                x,
+                fc1_upper,
+                fc1_lower,
+                fc2_upper,
+                fc2_lower,
+                self.top_k,
+                self.tp_size,
+                self.tp_rank,
+                self.ep_size,
+                self.ep_rank,
+                self.cluster_size,
+                self.cluster_rank,
+                self.enable_alltoall,
+                kwargs["gemm_idx"],
+                tactic,
+                do_preparation,
+                self.activation_type,
+            )
+
+        @classmethod
+        @functools.lru_cache(maxsize=None)
+        def refine_tuning_config(cls, tune_max_num_tokens: int):
+            cls.tuning_config = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        (0,),
+                        (0,),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                )
+            )
+
+    @register_custom_op(
+        "flashinfer::cutlass_dual_weight_fused_moe",
+        mutates_args=(""),
+    )
+    def cutlass_dual_weight_fused_moe(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        fc1_upper_weights: torch.Tensor,
+        fc1_lower_weights: torch.Tensor,
+        fc2_upper_weights: torch.Tensor,
+        fc2_lower_weights: torch.Tensor,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        cluster_size: int = 1,
+        cluster_rank: int = 0,
+        enable_alltoall: bool = False,
+        min_latency_mode: bool = False,
+        tune_max_num_tokens: int = 8192,
+        enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
+    ) -> List[torch.Tensor]:
+        if min_latency_mode:
+            raise NotImplementedError(
+                "Min latency mode is not supported for dual-weight MoE."
+            )
+        tuner = AutoTuner.get()
+        DualWeightMoERunner.refine_tuning_config(tune_max_num_tokens)
+
+        # allocate workspace for profiling
+        moe_runner = DualWeightMoERunner(
+            x_dtype=input.dtype,
+            weight_dtype=fc1_upper_weights.dtype,
+            output_dtype=output.dtype,
+            top_k=token_selected_experts.size(1),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=enable_alltoall,
+            activation_type=activation_type,
+        )
+        _, gemm_tactic_1 = tuner.choose_one(
+            "trtllm::dual_weight_fused_moe::gemm1",
+            [moe_runner],
+            DualWeightMoERunner.tuning_config,
+            [
+                input,
+                fc1_upper_weights,
+                fc1_lower_weights,
+                fc2_upper_weights,
+                fc2_lower_weights,
+            ],
+            gemm_idx=1,
+        )
+        _, gemm_tactic_2 = tuner.choose_one(
+            "trtllm::dual_weight_fused_moe::gemm2",
+            [moe_runner],
+            DualWeightMoERunner.tuning_config,
+            [
+                input,
+                fc1_upper_weights,
+                fc1_lower_weights,
+                fc2_upper_weights,
+                fc2_lower_weights,
+            ],
+            gemm_idx=2,
+        )
+
+        run_moe = moe_runner.fused_moe_runner.run_moe_dual_weight
+        num_active_experts_per_node = torch.empty(
+            (1,), dtype=torch.int32, device=input.device
+        )
+        experts_to_token_score = torch.empty(
+            (fc2_upper_weights.shape[0], input.shape[0]),
+            dtype=torch.float32,
+            device=input.device,
+        )
+        active_expert_global_ids = torch.empty(
+            (fc2_upper_weights.shape[0],),
+            dtype=torch.int32,
+            device=input.device,
+        )
+        run_moe(
+            output,
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_upper_weights,
+            fc1_lower_weights,
+            fc2_upper_weights,
+            fc2_lower_weights,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            enable_alltoall,
+            min_latency_mode,
+            [gemm_tactic_1, gemm_tactic_2],
+            enable_pdl,
+            activation_type,
+        )
+        return [
+            output,
+            num_active_experts_per_node,
+            experts_to_token_score,
+            active_expert_global_ids,
+        ]
+
+    @register_fake_op("flashinfer::cutlass_dual_weight_fused_moe")
+    def _fake_cutlass_dual_weight_fused_moe(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        fc1_upper_weights: torch.Tensor,
+        fc1_lower_weights: torch.Tensor,
+        fc2_upper_weights: torch.Tensor,
+        fc2_lower_weights: torch.Tensor,
+        output_dtype: torch.dtype,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        cluster_size: int = 1,
+        cluster_rank: int = 0,
+        enable_alltoall: bool = False,
+        min_latency_mode: bool = False,
+        tune_max_num_tokens: int = 8192,
+        enable_pdl: Optional[bool] = None,
+    ):
+        seq_len = input.shape[0]
+        hidden_size = fc2_upper_weights.shape[1]
+        return [
+            input.new_empty([seq_len, hidden_size], dtype=output_dtype),
+            input.new_empty([1], dtype=torch.int32),
+            input.new_empty([fc2_upper_weights.shape[0], seq_len], dtype=torch.float32),
+            input.new_empty([fc2_upper_weights.shape[0]], dtype=torch.int32),
+        ]
+
+    return SimpleNamespace(
+        cutlass_dual_weight_fused_moe=cutlass_dual_weight_fused_moe,
+    )
+
+
+def cutlass_dual_weight_fused_moe(
+    input: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    fc1_upper_weights: torch.Tensor,
+    fc1_lower_weights: torch.Tensor,
+    fc2_upper_weights: torch.Tensor,
+    fc2_lower_weights: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
+    output: Optional[torch.Tensor] = None,
+    enable_alltoall: bool = False,
+    min_latency_mode: bool = False,
+    tune_max_num_tokens: int = 8192,
+    enable_pdl: Optional[bool] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
+) -> List[torch.Tensor]:
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) != (8, 0):
+        raise RuntimeError("Dual-weight fused MoE is only available on SM80 GPUs.")
+    if min_latency_mode:
+        raise NotImplementedError(
+            "min latency mode not supported for dual-weight fused MoE."
+        )
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    if output_dtype != torch.float16:
+        raise NotImplementedError(
+            "Only float16 output is supported for dual-weight fused MoE."
+        )
+
+    num_rows = input.shape[0]
+    hidden_size = fc2_upper_weights.shape[1]
+    output_shape = (num_rows, hidden_size)
+
+    if output is None:
+        output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
+    else:
+        check_shape_dtype_device(
+            output, output_shape, output_dtype, input.device, "output"
+        )
+
+    check_shape_dtype_device(
+        input, (num_rows, hidden_size), torch.float16, input.device, "input"
+    )
+    check_shape_dtype_device(
+        token_selected_experts,
+        (num_rows, token_selected_experts.shape[1]),
+        torch.int32,
+        input.device,
+        "token_selected_experts",
+    )
+    if token_final_scales is not None:
+        check_shape_dtype_device(
+            token_final_scales,
+            token_selected_experts.shape,
+            torch.float32,
+            input.device,
+            "token_final_scales",
+        )
+    for tensor, name in [
+        (fc1_upper_weights, "fc1_upper_weights"),
+        (fc1_lower_weights, "fc1_lower_weights"),
+        (fc2_upper_weights, "fc2_upper_weights"),
+        (fc2_lower_weights, "fc2_lower_weights"),
+    ]:
+        check_shape_dtype_device(
+            tensor,
+            tensor.shape,
+            torch.float8_e4m3fn,
+            input.device,
+            name,
+        )
+    if fc1_upper_weights.shape != fc1_lower_weights.shape:
+        raise ValueError("fc1 upper and lower weights must have the same shape.")
+    if fc2_upper_weights.shape != fc2_lower_weights.shape:
+        raise ValueError("fc2 upper and lower weights must have the same shape.")
+
+    return get_cutlass_dual_weight_fused_moe_module().cutlass_dual_weight_fused_moe(
+        output,
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_upper_weights,
+        fc1_lower_weights,
+        fc2_upper_weights,
+        fc2_lower_weights,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        tp_size,
+        tp_rank,
+        ep_size,
+        ep_rank,
+        cluster_size,
+        cluster_rank,
+        enable_alltoall,
+        min_latency_mode,
+        tune_max_num_tokens,
+        enable_pdl,
+        activation_type,
     )
 
 

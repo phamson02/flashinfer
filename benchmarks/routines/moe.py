@@ -8,6 +8,7 @@ import flashinfer
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     WeightLayout,
+    cutlass_dual_weight_fused_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -15,7 +16,7 @@ from flashinfer.fused_moe import (
     convert_to_block_layout,
     fused_topk_deepseek,
 )
-from flashinfer.fused_moe.core import RoutingMethodType
+from flashinfer.fused_moe.core import ActivationType, RoutingMethodType
 from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -47,6 +48,8 @@ def run_moe_test(args):
         return testTrtllmFp8PerTensorScaleMoe(args)
     elif args.routine == "cutlass_fused_moe":
         return testCutlassFusedMoe(args)
+    elif args.routine == "cutlass_dual_weight_fused_moe":
+        return testCutlassDualWeightFusedMoe(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -187,7 +190,7 @@ def parse_moe_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe, cutlass_fused_moe, cutlass_dual_weight_fused_moe)."
         ),
     )
 
@@ -561,6 +564,29 @@ def _compute_routing_for_method(
         # and approximate for Llama4
         _, selected_experts = _compute_routing(routing_logits.float(), top_k)
         return selected_experts
+
+
+def _pack_fp16_to_nested_fp8_dual(weight_fp16: torch.Tensor):
+    """
+    Pack FP16 weights into the dual FP8 (upper/lower) encoding expected by the kernel.
+
+    Mirrors the kernel reconstruction:
+      s = upper & 0x80
+      sub = (lower & 0x80) >> 7
+      upper_recon = ((upper - sub) >> 1) & 0x3F | s
+      fp16 = (upper_recon << 8) | lower
+    """
+    raw = weight_fp16.view(torch.int16)
+    lower = raw & 0x00FF
+    upper = (raw >> 8) & 0x00FF
+
+    # Encode upper byte so that kernel reconstruction is lossless
+    sub = (lower >> 7) & 0x1
+    encoded_upper = ((upper & 0x80) | (((upper & 0x3F) << 1) + sub)) & 0xFF
+
+    upper_fp8 = encoded_upper.to(torch.uint8).view(torch.float8_e4m3fn)
+    lower_fp8 = lower.to(torch.uint8).view(torch.float8_e4m3fn)
+    return upper_fp8, lower_fp8
 
 
 def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
@@ -1764,6 +1790,218 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        res.append(cur_res)
+
+    return res
+
+
+def testCutlassDualWeightFusedMoe(args):
+    """
+    Benchmark cutlass_dual_weight_fused_moe (CUTLASS MoE with dual FP8 weights)
+    mirroring testCutlassFusedMoe structure.
+
+    This benchmark:
+    1. Creates FP16 base weights and packs them into nested FP8 upper/lower
+    2. Runs dual-weight fused MoE with FP16 activations
+    3. Measures performance metrics (TFLOPS, TB/sec)
+
+    Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testCutlassDualWeightFusedMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    input_dtype = torch.float16  # Dual-weight path is hard-wired to FP16 activations
+
+    # Shapes
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    tp_size = getattr(args, "tp_size", 1)
+    tp_rank = getattr(args, "tp_rank", 0)
+    ep_size = getattr(args, "ep_size", 1)
+    ep_rank = getattr(args, "ep_rank", 0)
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+    backends = ["cutlass"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    # Create base tensors
+    torch.manual_seed(args.random_seed)
+    x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device)
+    w31_weight = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=input_dtype,
+            device=device,
+        )
+        / 10
+    )
+    w2_weight = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=input_dtype,
+            device=device,
+        )
+        / 10
+    )
+
+    # Routing
+    router_logits = torch.randn(
+        num_tokens, num_experts, dtype=input_dtype, device=device
+    )
+    routing_weights, selected_experts = _compute_routing(router_logits, top_k)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] x.shape = {x.shape}")
+        print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
+        print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
+
+    # Build local weights per EP/TP like tests do
+    experts_per_rank = num_experts // max(ep_size, 1)
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+    w31_ep = w31_weight[expert_start:expert_end, :]
+    w2_ep = w2_weight[expert_start:expert_end, :]
+
+    def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
+        if tp_size <= 1:
+            return w31_ep_tensor, w2_ep_tensor
+        # Split w31 into w3 and w1 along intermediate dim
+        w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
+        shard = intermediate_size // tp_size
+        start = tp_rank * shard
+        end = start + shard
+        w3_local = w3_weight[:, start:end, :]
+        w1_local = w1_weight[:, start:end, :]
+        w31_local = torch.cat([w3_local, w1_local], dim=1)
+        w2_local = w2_ep_tensor[:, :, start:end]
+        return w31_local.contiguous(), w2_local.contiguous()
+
+    w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
+
+    # Pack FP16 weights into nested FP8 upper/lower for dual-weight kernels
+    fc1_upper, fc1_lower = _pack_fp16_to_nested_fp8_dual(w31_local)
+    fc2_upper, fc2_lower = _pack_fp16_to_nested_fp8_dual(w2_local)
+
+    out = torch.empty_like(x)
+
+    def run_cutlass():
+        return cutlass_dual_weight_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            fc1_upper,
+            fc1_lower,
+            fc2_upper,
+            fc2_lower,
+            output_dtype=input_dtype,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=1,
+            cluster_rank=0,
+            output=out,
+            enable_alltoall=False,
+            min_latency_mode=False,
+            tune_max_num_tokens=num_tokens,
+            enable_pdl=False,
+            activation_type=ActivationType.Swiglu,
+        )
+
+    backend = "cutlass"
+
+    # Optional autotune warmup (supported for CUTLASS fused MoE)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "cutlass_autotune"
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Autotune warmup for CUTLASS dual-weight fused MoE: {warmup_iters} iters"
+            )
+        with autotune(True):
+            for _ in range(warmup_iters):
+                run_cutlass()
+
+    # Measure
+    times = bench_gpu_time(
+        fn=run_cutlass,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
+
+    median_time = np.median(times)
+    std_time = np.std(times)
+    tflops = calculate_moe_tflops(
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time
+    )
+    tb_per_sec = calculate_moe_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        torch.float8_e4m3fn,
+        input_format=None,
+        weight_format="fp8",
+        routing_logits_dtype=router_logits.dtype,
+        active_experts=int(selected_experts.unique().numel()),
+    )
+
+    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+    if args.output_path is not None:
+        cur_res = defaultdict(str)
+        cur_res["routine"] = args.routine
+        cur_res["median_time"] = median_time
+        cur_res["std_time"] = std_time
+        cur_res["tflops"] = tflops
+        cur_res["tb_per_sec"] = tb_per_sec
+        cur_res["backend"] = backend
+        cur_res["num_tokens"] = num_tokens
+        cur_res["hidden_size"] = hidden_size
+        cur_res["intermediate_size"] = intermediate_size
+        cur_res["num_experts"] = num_experts
+        cur_res["top_k"] = top_k
+        # Routing method/weight layout not applicable; leave defaults
+        cur_res["use_shuffled_weight"] = False
+        cur_res["weight_layout"] = 0
+        cur_res["use_routing_scales_on_input"] = False
+        cur_res["input_dtype"] = input_dtype
+        cur_res["weight_dtype"] = torch.float8_e4m3fn
+        # CUTLASS dual-weight fused MoE specific
+        cur_res["cutlass_variant"] = "dual_weight"
+        cur_res["quantized_input"] = False
+        cur_res["tp_size"] = tp_size
+        cur_res["tp_rank"] = tp_rank
+        cur_res["ep_size"] = ep_size
+        cur_res["ep_rank"] = ep_rank
         res.append(cur_res)
 
     return res

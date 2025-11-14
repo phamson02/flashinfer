@@ -93,6 +93,73 @@ def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
+def gen_cutlass_dual_weight_fused_moe_sm80_module(
+    use_fast_build: bool = False,
+) -> JitSpec:
+    nvcc_flags = sm80_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    device_arch = "80"
+    output_dir = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
+    )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        generate_gemm_operations(
+            output_dir,
+            f"{device_arch};{device_arch}-real",
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
+
+    sources = [
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp8.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
+        *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/cutlass_backend/flashinfer_cutlass_dual_weight_fused_moe_sm80_binding.cu",
+    ]
+    return gen_jit_spec(
+        "dual_weight_fused_moe_sm80",
+        sources,
+        extra_cuda_cflags=nvcc_flags,
+        extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
+        extra_ldflags=["-lnvrtc"],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "cutlass_extensions"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "cutlass_kernels"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "cutlass_kernels",
+        ],
+    )
+
+
 def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",

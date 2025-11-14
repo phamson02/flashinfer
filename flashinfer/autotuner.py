@@ -1,13 +1,16 @@
+import atexit
 import contextlib
 import copy
 import importlib
 import inspect
 import itertools
+import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Set, Tuple, Union, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -35,6 +38,18 @@ def get_config_path(is_module: bool):
             "tuning_configs",
             config_name + ".py",
         )
+
+
+def default_profiling_cache_file() -> Path:
+    cache_root = os.environ.get("XDG_CACHE_HOME")
+    if cache_root:
+        base = Path(cache_root)
+    else:
+        try:
+            base = Path.home() / ".cache"
+        except RuntimeError:
+            base = Path.cwd() / ".cache"
+    return base / "flashinfer" / "autotuner_cache.json"
 
 
 @dataclass(slots=True)
@@ -249,15 +264,18 @@ class TunableRunner(ABC):
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True):
-    old_mode = AutoTuner.get().is_tuning_mode
-    AutoTuner.get().is_tuning_mode = tune_mode
+    tuner = AutoTuner.get()
+    old_mode = tuner.is_tuning_mode
+    tuner.is_tuning_mode = tune_mode
     autotune_enabled = tune_mode and not old_mode
     if autotune_enabled:
         logger.info("[Autotuner]: Autotuning process starts ...")
     try:
         yield
     finally:
-        AutoTuner.get().is_tuning_mode = old_mode
+        tuner.is_tuning_mode = old_mode
+        if autotune_enabled and tuner.persistent_cache_enabled:
+            tuner.maybe_persist_cache()
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
@@ -345,18 +363,52 @@ class AutoTuner:
     """
 
     _instance = None
+    _atexit_registered = False
 
     def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
-        self.is_tuning_mode = False
+        self.is_tuning_mode = (
+            os.environ.get("FLASHINFER_AUTOTUNER_TUNING_MODE", "0") == "1"
+        )
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
 
         self.profiling_debug = True
+
+        cache_path_raw = os.environ.get("FLASHINFER_AUTOTUNER_CACHE_PATH")
+        self.cache_path = (
+            Path(cache_path_raw).expanduser()
+            if cache_path_raw
+            else default_profiling_cache_file()
+        )
+        self.persistent_cache_enabled = (
+            os.environ.get("FLASHINFER_AUTOTUNER_CACHE", "0") == "1"
+        )  # default to false
+        self.persistent_cache: Dict[
+            Tuple[str, str, Tuple[Tuple[int, ...], ...]], int
+        ] = {}
+
+        self._disk_cache_loaded = False
+        self._cache_dirty = False
+        if self.persistent_cache_enabled:
+            AutoTuner._register_atexit_handler()
+
+    @classmethod
+    def _register_atexit_handler(cls) -> None:
+        if cls._atexit_registered:
+            return
+        atexit.register(cls._flush_cache_on_exit)
+        cls._atexit_registered = True
+
+    @staticmethod
+    def _flush_cache_on_exit() -> None:
+        instance = AutoTuner._instance
+        if instance is not None:
+            instance._persist_cache_to_disk()
 
     @classmethod
     def get(cls):
@@ -382,7 +434,11 @@ class AutoTuner:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
-        for r in runners:
+        nearest_profile = AutoTuner._find_nearest_profile(input_shapes, tuning_config)
+        self._load_disk_cache_once()
+        for runner_id, r in enumerate(runners):
+            if self.persistent_cache_enabled:
+                self._hydrate_cache_from_disk(custom_op, r, nearest_profile, runner_id)
             cache_key = AutoTuner._get_cache_key(
                 custom_op, r, input_shapes, tuning_config
             )
@@ -396,6 +452,113 @@ class AutoTuner:
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
+
+    def _load_disk_cache_once(self) -> None:
+        if not self.persistent_cache_enabled or self._disk_cache_loaded:
+            return
+        self._disk_cache_loaded = True
+        path = self.cache_path
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning(
+                f"[Autotuner]: Failed to read persistent cache from {path}: {exc}"
+            )
+            return
+
+        entries = payload.get("entries", [])
+        if not isinstance(entries, list):
+            logger.warning(
+                f"[Autotuner]: Ignoring malformed cache file at {path}: entries is not a list."
+            )
+            return
+
+        for entry in entries:
+            try:
+                custom_op = entry["custom_op"]
+                runner_name = entry["runner"]
+                profile_data = entry["profile"]
+                tactic = int(entry["tactic"])
+            except (KeyError, TypeError, ValueError):
+                logger.debug("[Autotuner]: Skipping malformed cache entry %s.", entry)
+                continue
+            try:
+                profile_key = tuple(
+                    tuple(int(dim) for dim in dims) for dims in profile_data
+                )
+            except TypeError:
+                logger.debug(
+                    "[Autotuner]: Skipping cache entry with invalid profile %s.",
+                    profile_data,
+                )
+                continue
+            self.persistent_cache[(custom_op, runner_name, profile_key)] = tactic
+
+    def _hydrate_cache_from_disk(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        profile: Tuple[Tuple[int, ...], ...],
+        runner_id: int,
+    ) -> None:
+        tactic = self.persistent_cache.get(
+            (custom_op, runner.__class__.__name__, profile)
+        )
+        if tactic is None:
+            return
+        cache_key = (
+            custom_op,
+            runner.__class__.__name__,
+            hash(runner),
+            profile,
+        )
+        if cache_key not in self.profiling_cache:
+            self.profiling_cache[cache_key] = (runner_id, tactic, None)
+
+    def _persist_cache_to_disk(self) -> None:
+        if not self.persistent_cache_enabled or not self._cache_dirty:
+            return
+        entries = []
+        for (custom_op, runner_name, _runner_hash, profile), (
+            _runner_id,
+            tactic,
+            _,
+        ) in self.profiling_cache.items():
+            profile_list = [list(dim) for dim in profile]
+            entries.append(
+                {
+                    "custom_op": custom_op,
+                    "runner": runner_name,
+                    "profile": profile_list,
+                    "tactic": int(tactic),
+                }
+            )
+
+        entries.sort(
+            key=lambda item: (
+                item["custom_op"],
+                item["runner"],
+                tuple(tuple(row) for row in item["profile"]),
+            )
+        )
+        payload = {"version": 1, "entries": entries}
+        path = self.cache_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.parent / (path.name + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True)
+            os.replace(tmp_path, path)
+            self._cache_dirty = False
+            logger.debug(f"[Autotuner]: Persisted cache to {path}")
+        except Exception as exc:
+            logger.warning(f"[Autotuner]: Failed to persist cache to {path}: {exc}")
+
+    def maybe_persist_cache(self) -> None:
+        self._persist_cache_to_disk()
 
     def choose_one(
         self,
@@ -518,6 +681,7 @@ class AutoTuner:
                     )
                     # inspect call stack
                     self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                    self._cache_dirty = True
                     self.stats.tuned_op_successful_configs[custom_op] = (
                         self.stats.tuned_op_successful_configs.get(custom_op, 0) + 1
                     )
@@ -785,6 +949,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        self.persistent_cache.clear()
+        self._cache_dirty = True
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

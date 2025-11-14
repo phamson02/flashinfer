@@ -22,6 +22,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/half.h"
+#include "cutlass/detail/dependent_false.hpp"
 #include "cutlass/layout/matrix.h"
 #include "cutlass_extensions/arch/mma.h"
 #include "cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h"
@@ -32,7 +33,7 @@ namespace kernel {
 
 template <typename TypeA, typename TypeB, typename arch, typename Enable = void>
 struct MixedGemmArchTraits {
-  static_assert(dependent_false<arch>, "Unrecognised parameterization");
+  static_assert(cutlass::detail::dependent_false<arch>, "Unrecognised parameterization");
 };
 
 template <typename Arch>
