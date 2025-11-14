@@ -54,6 +54,21 @@ struct DefaultGemm_TensorOpSm80_OperandA<cute::bfloat16_t, cutlass::layout::RowM
       cute::Layout<cute::Shape<cute::_1, cute::_8>>{}));
 };
 
+template <>
+struct DefaultGemm_TensorOpSm80_OperandA<cute::float_e4m3_t, cutlass::layout::RowMajor, 8, 64> {
+  // Smem
+  using SmemLayoutAtom = decltype(cute::composition(
+      cute::Swizzle<2, 3, 3>{},
+      cute::Layout<cute::Shape<cute::_8, cute::_32>, cute::Stride<cute::_32, cute::_1>>{}));
+  using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint16_t>;
+
+  // Gmem
+  using GmemTiledCopy = decltype(cute::make_tiled_copy(
+      cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint16_t>{},
+      cute::Layout<cute::Shape<cute::_32, cute::_4>, cute::Stride<cute::_4, cute::_1>>{},
+      cute::Layout<cute::Shape<cute::_1, cute::_8>>{}));
+};
+
 /// Operand A - Column-major (M-major)
 template <int SizeK>
 struct DefaultGemm_TensorOpSm80_OperandA<cute::half_t, cutlass::layout::ColumnMajor, 8, SizeK> {
@@ -100,6 +115,12 @@ struct DefaultGemm_TensorOpSm80_OperandB<cute::bfloat16_t, cutlass::layout::Colu
     : DefaultGemm_TensorOpSm80_OperandA<cute::bfloat16_t, cutlass::layout::RowMajor, Alignment,
                                         SizeK> {};
 
+template <int Alignment, int SizeK>
+struct DefaultGemm_TensorOpSm80_OperandB<cute::float_e4m3_t, cutlass::layout::ColumnMajor, Alignment,
+                                          SizeK>
+    : DefaultGemm_TensorOpSm80_OperandA<cute::float_e4m3_t, cutlass::layout::RowMajor, Alignment,
+                                        SizeK> {};
+
 // Operand B - Row-Major (N-major)
 template <int Alignment, int SizeK>
 struct DefaultGemm_TensorOpSm80_OperandB<cute::half_t, cutlass::layout::RowMajor, Alignment, SizeK>
@@ -143,6 +164,21 @@ struct DefaultGemm_TensorOpSm80_OperandA<cute::bfloat16_t, cutlass::layout::RowM
   // Gmem
   using GmemTiledCopy = decltype(cute::make_tiled_copy(
       cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, cute::bfloat16_t>{},
+      cute::Layout<cute::Shape<cute::_32, cute::_4>, cute::Stride<cute::_4, cute::_1>>{},
+      cute::Layout<cute::Shape<cute::_1, cute::_8>>{}));
+};
+
+template <>
+struct DefaultGemm_TensorOpSm80_OperandA<cute::float_e4m3_t, cutlass::layout::RowMajor, 8, 32> {
+  // Smem
+  using SmemLayoutAtom = decltype(cute::composition(
+      cute::Swizzle<2, 3, 3>{},
+      cute::Layout<cute::Shape<cute::_8, cute::_16>, cute::Stride<cute::_16, cute::_1>>{}));
+  using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint16_t>;
+
+  // Gmem
+  using GmemTiledCopy = decltype(cute::make_tiled_copy(
+      cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint16_t>{},
       cute::Layout<cute::Shape<cute::_32, cute::_4>, cute::Stride<cute::_4, cute::_1>>{},
       cute::Layout<cute::Shape<cute::_1, cute::_8>>{}));
 };

@@ -78,6 +78,8 @@ from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     ActivationType,
     RoutingMethodType,
+    GatedActType,
+    cutlass_dual_weight_fused_moe,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,

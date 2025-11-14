@@ -265,9 +265,10 @@ class MoeGemmRunner {
   static constexpr bool use_fp8_weights =
       std::is_same_v<WeightType, __nv_fp8_e4m3> || std::is_same_v<WeightType, __nv_fp8_e5m2>;
   static constexpr bool use_fp8_any = use_fp8_activation || use_fp8_weights;
-  static constexpr bool use_fp8 = use_fp8_activation && !std::is_same_v<WeightType, cutlass::uint4b_t>
+  static constexpr bool use_fp8 = use_fp8_activation &&
+                                  !std::is_same_v<WeightType, cutlass::uint4b_t>
 #if defined(ENABLE_FP4)
-      && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+                                  && !std::is_same_v<WeightType, __nv_fp4_e2m1>
 #endif
       ;
   static constexpr bool use_w4afp8 =
