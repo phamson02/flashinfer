@@ -845,12 +845,16 @@ def test_moe_fp16_activation_fp8_weight(
     )
     flash_output = torch.empty_like(ref_output)
 
+    # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
+    w31_weight_mma = shuffle_fp8_weights_for_mma(w31_weight)
+    w2_weight_mma = shuffle_fp8_weights_for_mma(w2_weight)
+
     fused_moe.cutlass_fused_moe(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        w31_weight,
-        w2_weight,
+        w31_weight_mma,
+        w2_weight_mma,
         otype,
         quant_scales=None,
         output=flash_output,
