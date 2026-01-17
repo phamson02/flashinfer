@@ -336,8 +336,9 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
   finalizeMoeRoutingKernelLauncher<OutputType, T>(
       static_cast<T const*>(gemm_output), final_output, fc2_expert_biases,
       token_topk_unpermuted_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
-      token_selected_experts, expert_first_token_offset, num_rows, hidden_size, experts_per_token,
-      num_experts_per_node, parallelism_config, enable_alltoall, /*enable_pdl*/ false, stream);
+      token_selected_experts, expert_first_token_offset, num_rows, hidden_size, hidden_size,
+      experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall,
+      /*enable_pdl*/ false, stream);
 
   sync_check_cuda_error(stream);
 }
@@ -440,6 +441,7 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
                                 experts_per_token, num_experts_per_node, empty_quant_params,
                                 /*use_per_expert_act_scale*/ false, expert_first_token_offset_,
                                 /*fc1_act_sf_flat*/ nullptr, /*input_sf*/ nullptr,
+                                /*swizzled_input_sf*/ false,
                                 /*prequant_scales*/ nullptr, /*enable_pdl*/ false, stream);
   auto const* gemm1_input = gemm1_input_expand;
 
