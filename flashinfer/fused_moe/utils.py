@@ -248,3 +248,68 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+def shuffle_fp8_weights_for_mma(weight_fp8: torch.Tensor) -> torch.Tensor:
+    weight_fp8 = weight_fp8.contiguous()
+    original_shape = weight_fp8.shape
+    weight_u8 = weight_fp8.view(torch.uint8)
+
+    if len(original_shape) == 3:
+        num_experts, rows, cols = original_shape
+        if cols % 16 != 0:
+            raise ValueError(f"K must be divisible by 16, got {cols}")
+        reshaped = weight_u8.reshape(num_experts, rows, cols // 16, 4, 4)
+        shuffled = torch.empty_like(reshaped)
+
+        shuffled[:, :, :, 0, 0] = reshaped[:, :, :, 0, 0]
+        shuffled[:, :, :, 0, 1] = reshaped[:, :, :, 0, 1]
+        shuffled[:, :, :, 0, 2] = reshaped[:, :, :, 2, 0]
+        shuffled[:, :, :, 0, 3] = reshaped[:, :, :, 2, 1]
+
+        shuffled[:, :, :, 1, 0] = reshaped[:, :, :, 0, 2]
+        shuffled[:, :, :, 1, 1] = reshaped[:, :, :, 0, 3]
+        shuffled[:, :, :, 1, 2] = reshaped[:, :, :, 2, 2]
+        shuffled[:, :, :, 1, 3] = reshaped[:, :, :, 2, 3]
+
+        shuffled[:, :, :, 2, 0] = reshaped[:, :, :, 1, 0]
+        shuffled[:, :, :, 2, 1] = reshaped[:, :, :, 1, 1]
+        shuffled[:, :, :, 2, 2] = reshaped[:, :, :, 3, 0]
+        shuffled[:, :, :, 2, 3] = reshaped[:, :, :, 3, 1]
+
+        shuffled[:, :, :, 3, 0] = reshaped[:, :, :, 1, 2]
+        shuffled[:, :, :, 3, 1] = reshaped[:, :, :, 1, 3]
+        shuffled[:, :, :, 3, 2] = reshaped[:, :, :, 3, 2]
+        shuffled[:, :, :, 3, 3] = reshaped[:, :, :, 3, 3]
+
+        result = shuffled.reshape(num_experts, rows, cols)
+        return result.view(weight_fp8.dtype)
+    if len(original_shape) == 2:
+        rows, cols = original_shape
+        if cols % 16 != 0:
+            raise ValueError(f"K must be divisible by 16, got {cols}")
+        reshaped = weight_u8.reshape(rows, cols // 16, 4, 4)
+        shuffled = torch.empty_like(reshaped)
+
+        shuffled[:, :, 0, 0] = reshaped[:, :, 0, 0]
+        shuffled[:, :, 0, 1] = reshaped[:, :, 0, 1]
+        shuffled[:, :, 0, 2] = reshaped[:, :, 2, 0]
+        shuffled[:, :, 0, 3] = reshaped[:, :, 2, 1]
+
+        shuffled[:, :, 1, 0] = reshaped[:, :, 0, 2]
+        shuffled[:, :, 1, 1] = reshaped[:, :, 0, 3]
+        shuffled[:, :, 1, 2] = reshaped[:, :, 2, 2]
+        shuffled[:, :, 1, 3] = reshaped[:, :, 2, 3]
+
+        shuffled[:, :, 2, 0] = reshaped[:, :, 1, 0]
+        shuffled[:, :, 2, 1] = reshaped[:, :, 1, 1]
+        shuffled[:, :, 2, 2] = reshaped[:, :, 3, 0]
+        shuffled[:, :, 2, 3] = reshaped[:, :, 3, 1]
+
+        shuffled[:, :, 3, 0] = reshaped[:, :, 1, 2]
+        shuffled[:, :, 3, 1] = reshaped[:, :, 1, 3]
+        shuffled[:, :, 3, 2] = reshaped[:, :, 3, 2]
+        shuffled[:, :, 3, 3] = reshaped[:, :, 3, 3]
+
+        result = shuffled.reshape(rows, cols)
+        return result.view(weight_fp8.dtype)
+    raise ValueError(f"Unsupported weight shape: {original_shape}")
