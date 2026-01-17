@@ -1475,6 +1475,9 @@ def test_moe_fp8_block_scaling(
         top_k: Number of experts to route to per token
         intermediate_size: Intermediate dimension size
     """
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FP8 block scaling is only supported on SM90.")
+
     torch.manual_seed(42)
     otype = torch.bfloat16
 
