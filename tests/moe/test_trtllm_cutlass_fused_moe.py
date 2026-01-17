@@ -18,6 +18,7 @@ from contextlib import nullcontext
 
 import pytest
 from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.utils import shuffle_fp8_weights_for_mma
 import torch
 from torch.nn import functional as F
 
@@ -595,14 +596,20 @@ def test_dual_weight_fused_moe_matches_single_weight(
     )
     dual_output_buffer = torch.empty_like(base_output_buffer)
 
+    # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
+    fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
+    fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
+    fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
+    fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
+
     dual_output = fused_moe.cutlass_dual_weight_fused_moe(
         x,
         selected_experts.to(torch.int32),
         routing_weights,
-        fc1_upper_fp8,
-        fc1_lower_fp8,
-        fc2_upper_fp8,
-        fc2_lower_fp8,
+        fc1_upper_fp8_mma,
+        fc1_lower_fp8_mma,
+        fc2_upper_fp8_mma,
+        fc2_lower_fp8_mma,
         output=dual_output_buffer,
     )
 
@@ -678,14 +685,20 @@ def test_dual_weight_fused_moe_non_gated(
     )
     dual_output_buffer = torch.empty_like(base_output_buffer)
 
+    # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
+    fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
+    fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
+    fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
+    fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
+
     dual_output = fused_moe.cutlass_dual_weight_fused_moe(
         x,
         selected_experts.to(torch.int32),
         routing_weights,
-        fc1_upper_fp8,
-        fc1_lower_fp8,
-        fc2_upper_fp8,
-        fc2_lower_fp8,
+        fc1_upper_fp8_mma,
+        fc1_lower_fp8_mma,
+        fc2_upper_fp8_mma,
+        fc2_lower_fp8_mma,
         output=dual_output_buffer,
         activation_type=activation_type,
     )
