@@ -1173,12 +1173,14 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
         fc1_upper_weights: torch.Tensor,
         fc1_lower_weights: torch.Tensor,
         fc2_upper_weights: torch.Tensor,
         fc2_lower_weights: torch.Tensor,
-        output_dtype: torch.dtype,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
         ep_size: int = 1,
@@ -1189,11 +1191,12 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_upper_weights.shape[1]
         return [
-            input.new_empty([seq_len, hidden_size], dtype=output_dtype),
+            input.new_empty([seq_len, hidden_size], dtype=output.dtype),
             input.new_empty([1], dtype=torch.int32),
             input.new_empty([fc2_upper_weights.shape[0], seq_len], dtype=torch.float32),
             input.new_empty([fc2_upper_weights.shape[0]], dtype=torch.int32),
