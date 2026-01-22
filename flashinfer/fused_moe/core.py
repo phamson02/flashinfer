@@ -1073,7 +1073,7 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
-    ) -> List[torch.Tensor]:
+    ) -> torch.Tensor:
         if min_latency_mode:
             raise NotImplementedError(
                 "Min latency mode is not supported for dual-weight MoE."
@@ -1124,19 +1124,6 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         )
 
         run_moe = moe_runner.fused_moe_runner.run_moe_dual_weight
-        num_active_experts_per_node = torch.empty(
-            (1,), dtype=torch.int32, device=input.device
-        )
-        experts_to_token_score = torch.empty(
-            (fc2_upper_weights.shape[0], input.shape[0]),
-            dtype=torch.float32,
-            device=input.device,
-        )
-        active_expert_global_ids = torch.empty(
-            (fc2_upper_weights.shape[0],),
-            dtype=torch.int32,
-            device=input.device,
-        )
         run_moe(
             output,
             input,
@@ -1161,12 +1148,7 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             enable_pdl,
             activation_type,
         )
-        return [
-            output,
-            num_active_experts_per_node,
-            experts_to_token_score,
-            active_expert_global_ids,
-        ]
+        return output
 
     @register_fake_op("flashinfer::cutlass_dual_weight_fused_moe")
     def _fake_cutlass_dual_weight_fused_moe(
@@ -1195,12 +1177,7 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_upper_weights.shape[1]
-        return [
-            input.new_empty([seq_len, hidden_size], dtype=output.dtype),
-            input.new_empty([1], dtype=torch.int32),
-            input.new_empty([fc2_upper_weights.shape[0], seq_len], dtype=torch.float32),
-            input.new_empty([fc2_upper_weights.shape[0]], dtype=torch.int32),
-        ]
+        return input.new_empty([seq_len, hidden_size], dtype=output.dtype)
 
     return SimpleNamespace(
         cutlass_dual_weight_fused_moe=cutlass_dual_weight_fused_moe,
@@ -1231,7 +1208,7 @@ def cutlass_dual_weight_fused_moe(
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
-) -> List[torch.Tensor]:
+) -> torch.Tensor:
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) != (8, 0):
         raise RuntimeError("Dual-weight fused MoE is only available on SM80 GPUs.")

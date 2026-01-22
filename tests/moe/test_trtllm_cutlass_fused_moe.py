@@ -587,14 +587,13 @@ def test_dual_weight_fused_moe_matches_single_weight(
     w2_reconstructed = reconstruct_fp16_from_dual_fp8(fc2_upper_fp8, fc2_lower_fp8)
 
     # Compute reference output using reconstructed weights
-    base_output_buffer = moe_reference_swiglu(
+    ref_output = moe_reference_swiglu(
         x,
         w31_reconstructed,
         w2_reconstructed,
         routing_weights,
         selected_experts.to(torch.int32),
     )
-    dual_output_buffer = torch.empty_like(base_output_buffer)
 
     # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
     fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
@@ -602,7 +601,8 @@ def test_dual_weight_fused_moe_matches_single_weight(
     fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
     fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
 
-    dual_output = fused_moe.cutlass_dual_weight_fused_moe(
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_dual_weight_fused_moe(
         x,
         selected_experts.to(torch.int32),
         routing_weights,
@@ -610,11 +610,11 @@ def test_dual_weight_fused_moe_matches_single_weight(
         fc1_lower_fp8_mma,
         fc2_upper_fp8_mma,
         fc2_lower_fp8_mma,
-        output=dual_output_buffer,
+        output=flash_output,
     )
 
     torch.testing.assert_close(
-        base_output_buffer, dual_output_buffer, rtol=1e-1, atol=1e-1
+        ref_output, flash_output, rtol=1e-1, atol=1e-1
     )
 
 
@@ -675,7 +675,7 @@ def test_dual_weight_fused_moe_non_gated(
     w2_reconstructed = reconstruct_fp16_from_dual_fp8(fc2_upper_fp8, fc2_lower_fp8)
 
     # Compute reference output using reconstructed weights and non-gated activation
-    base_output_buffer = moe_reference_non_gated(
+    ref_output = moe_reference_non_gated(
         x,
         w1_reconstructed,
         w2_reconstructed,
@@ -683,7 +683,6 @@ def test_dual_weight_fused_moe_non_gated(
         selected_experts.to(torch.int32),
         activation_type,
     )
-    dual_output_buffer = torch.empty_like(base_output_buffer)
 
     # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
     fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
@@ -691,7 +690,8 @@ def test_dual_weight_fused_moe_non_gated(
     fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
     fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
 
-    dual_output = fused_moe.cutlass_dual_weight_fused_moe(
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_dual_weight_fused_moe(
         x,
         selected_experts.to(torch.int32),
         routing_weights,
@@ -699,12 +699,12 @@ def test_dual_weight_fused_moe_non_gated(
         fc1_lower_fp8_mma,
         fc2_upper_fp8_mma,
         fc2_lower_fp8_mma,
-        output=dual_output_buffer,
+        output=flash_output,
         activation_type=activation_type,
     )
 
     torch.testing.assert_close(
-        base_output_buffer, dual_output_buffer, rtol=1e-1, atol=1e-1
+        ref_output, flash_output, rtol=1e-1, atol=1e-1
     )
 
 
