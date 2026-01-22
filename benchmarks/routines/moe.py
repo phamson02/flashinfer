@@ -24,6 +24,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import RoutingMethodType
 from flashinfer import fp4_quantize, mxfp8_quantize
+from flashinfer.fused_moe.utils import shuffle_fp8_weights_for_mma
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -1764,6 +1765,10 @@ def testCutlassDualWeightFusedMoe(args):
     # Pack FP16 weights into nested FP8 upper/lower for dual-weight kernels
     fc1_upper, fc1_lower = _pack_fp16_to_nested_fp8_dual(w31_local)
     fc2_upper, fc2_lower = _pack_fp16_to_nested_fp8_dual(w2_local)
+    fc1_upper = shuffle_fp8_weights_for_mma(fc1_upper)
+    fc1_lower = shuffle_fp8_weights_for_mma(fc1_lower)
+    fc2_upper = shuffle_fp8_weights_for_mma(fc2_upper)
+    fc2_lower = shuffle_fp8_weights_for_mma(fc2_lower)
 
     out = torch.empty_like(x)
 
