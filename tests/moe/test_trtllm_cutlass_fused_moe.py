@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from contextlib import nullcontext
+from typing import Optional
 
 import pytest
 from flashinfer.fused_moe.core import ActivationType
@@ -256,6 +257,8 @@ def moe_reference_swiglu(
     fc2_weights: torch.Tensor,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
+    fc1_biases: Optional[torch.Tensor] = None,
+    fc2_biases: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a simple Swiglu MoE reference on CPU/GPU using reconstructed FP16 weights."""
     batch, hidden = x.shape
@@ -269,8 +272,16 @@ def moe_reference_swiglu(
             w3 = fc1_weights[eid, :inter, :]
             w1 = fc1_weights[eid, inter:, :]
             w2 = fc2_weights[eid]
-            act = F.silu(x[b] @ w1.T) * (x[b] @ w3.T)
-            out[b] += routing_weights[b, j] * (act @ w2.T)
+            w1_out = x[b] @ w1.T
+            w3_out = x[b] @ w3.T
+            if fc1_biases is not None:
+                w3_out = w3_out + fc1_biases[eid, :inter]
+                w1_out = w1_out + fc1_biases[eid, inter:]
+            act = F.silu(w1_out) * w3_out
+            expert_out = act @ w2.T
+            if fc2_biases is not None:
+                expert_out = expert_out + fc2_biases[eid]
+            out[b] += routing_weights[b, j] * expert_out
     return out
 
 
@@ -281,6 +292,8 @@ def moe_reference_non_gated(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     activation_type: ActivationType,
+    fc1_biases: Optional[torch.Tensor] = None,
+    fc2_biases: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a non-gated MoE reference on CPU/GPU using reconstructed FP16 weights.
 
@@ -307,8 +320,14 @@ def moe_reference_non_gated(
             eid = selected_experts[b, j].item()
             w1 = fc1_weights[eid]  # [intermediate_size, hidden_size]
             w2 = fc2_weights[eid]  # [hidden_size, intermediate_size]
-            act = act_fn(x[b] @ w1.T)
-            out[b] += routing_weights[b, j] * (act @ w2.T)
+            w1_out = x[b] @ w1.T
+            if fc1_biases is not None:
+                w1_out = w1_out + fc1_biases[eid]
+            act = act_fn(w1_out)
+            expert_out = act @ w2.T
+            if fc2_biases is not None:
+                expert_out = expert_out + fc2_biases[eid]
+            out[b] += routing_weights[b, j] * expert_out
     return out
 
 
@@ -576,6 +595,10 @@ def test_dual_weight_fused_moe_matches_single_weight(
 
     w31_fp16 = gen_tensor(w31_shape, torch.float16, scale=0.1)
     w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+    fc1_biases = gen_tensor(
+        (num_experts, 2 * intermediate_size), torch.float16, scale=0.05
+    )
+    fc2_biases = gen_tensor((num_experts, hidden_size), torch.float16, scale=0.05)
 
     # Pack FP16 weights into dual FP8 upper/lower encoding that the kernel reconstructs.
     fc1_upper_fp8, fc1_lower_fp8 = pack_fp16_to_dual_fp8(w31_fp16)
@@ -594,6 +617,8 @@ def test_dual_weight_fused_moe_matches_single_weight(
         w2_reconstructed,
         routing_weights,
         selected_experts.to(torch.int32),
+        fc1_biases=fc1_biases,
+        fc2_biases=fc2_biases,
     )
 
     # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
@@ -611,6 +636,8 @@ def test_dual_weight_fused_moe_matches_single_weight(
         fc1_lower_fp8_mma,
         fc2_upper_fp8_mma,
         fc2_lower_fp8_mma,
+        fc1_biases,
+        fc2_biases,
         output=flash_output,
     )
 
@@ -664,6 +691,10 @@ def test_dual_weight_fused_moe_non_gated(
 
     w1_fp16 = gen_tensor(w1_shape, torch.float16, scale=0.1)
     w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+    fc1_biases = gen_tensor(
+        (num_experts, intermediate_size), torch.float16, scale=0.05
+    )
+    fc2_biases = gen_tensor((num_experts, hidden_size), torch.float16, scale=0.05)
 
     # Pack FP16 weights into dual FP8 upper/lower encoding that the kernel reconstructs.
     fc1_upper_fp8, fc1_lower_fp8 = pack_fp16_to_dual_fp8(w1_fp16)
@@ -683,6 +714,8 @@ def test_dual_weight_fused_moe_non_gated(
         routing_weights,
         selected_experts.to(torch.int32),
         activation_type,
+        fc1_biases=fc1_biases,
+        fc2_biases=fc2_biases,
     )
 
     # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
@@ -700,6 +733,8 @@ def test_dual_weight_fused_moe_non_gated(
         fc1_lower_fp8_mma,
         fc2_upper_fp8_mma,
         fc2_lower_fp8_mma,
+        fc1_biases,
+        fc2_biases,
         output=flash_output,
         activation_type=activation_type,
     )
