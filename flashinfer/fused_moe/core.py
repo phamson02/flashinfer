@@ -980,6 +980,8 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
                 output_dtype,
             )
             self.activation_type = activation_type
+            # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
+            self.gemm_idx_for_tuning: Optional[int] = None
 
             if instance_key not in DualWeightMoERunner.runner_dict:
                 DualWeightMoERunner.runner_dict[instance_key] = module.init(
@@ -995,8 +997,20 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            del inputs, profile
-            return list(range(self.fused_moe_runner.get_tactic_num()))
+            # Prefer filtering tactics by GEMM stage to avoid invalid combos during tuning
+            try:
+                gemm1_count = self.fused_moe_runner.get_gemm1_tactic_count()
+                gemm2_count = self.fused_moe_runner.get_gemm2_tactic_count()
+                total = gemm1_count + gemm2_count
+            except Exception:
+                return list(range(self.fused_moe_runner.get_tactic_num()))
+
+            stage = getattr(self, "gemm_idx_for_tuning", None)
+            if stage == 1:
+                return list(range(gemm1_count))
+            if stage == 2:
+                return list(range(gemm1_count, gemm1_count + gemm2_count))
+            return list(range(total))
 
         def forward(
             self,
@@ -1009,15 +1023,19 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
                 x,
                 fc1_upper,
                 fc1_lower,
+                fc1_biases,
                 fc2_upper,
                 fc2_lower,
+                fc2_biases,
             ) = inputs
             self.fused_moe_runner.run_gemm_profile_dual_weight(
                 x,
                 fc1_upper,
                 fc1_lower,
+                fc1_biases,
                 fc2_upper,
                 fc2_lower,
+                fc2_biases,
                 self.top_k,
                 self.tp_size,
                 self.tp_rank,
@@ -1054,11 +1072,13 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
+        token_final_scales: torch.Tensor,
         fc1_upper_weights: torch.Tensor,
         fc1_lower_weights: torch.Tensor,
         fc2_upper_weights: torch.Tensor,
         fc2_lower_weights: torch.Tensor,
+        fc1_biases: Optional[torch.Tensor] = None,
+        fc2_biases: Optional[torch.Tensor] = None,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
@@ -1096,6 +1116,8 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             enable_alltoall=enable_alltoall,
             activation_type=activation_type,
         )
+        # Limit tactics to GEMM1 during tuning
+        moe_runner.gemm_idx_for_tuning = 1
         _, gemm_tactic_1 = tuner.choose_one(
             "trtllm::dual_weight_fused_moe::gemm1",
             [moe_runner],
@@ -1104,11 +1126,15 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
                 input,
                 fc1_upper_weights,
                 fc1_lower_weights,
+                fc1_biases,
                 fc2_upper_weights,
                 fc2_lower_weights,
+                fc2_biases,
             ],
             gemm_idx=1,
         )
+        # Limit tactics to GEMM2 during tuning
+        moe_runner.gemm_idx_for_tuning = 2
         _, gemm_tactic_2 = tuner.choose_one(
             "trtllm::dual_weight_fused_moe::gemm2",
             [moe_runner],
@@ -1117,8 +1143,10 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
                 input,
                 fc1_upper_weights,
                 fc1_lower_weights,
+                fc1_biases,
                 fc2_upper_weights,
                 fc2_lower_weights,
+                fc2_biases,
             ],
             gemm_idx=2,
         )
@@ -1131,8 +1159,10 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             token_final_scales,
             fc1_upper_weights,
             fc1_lower_weights,
+            fc1_biases,
             fc2_upper_weights,
             fc2_lower_weights,
+            fc2_biases,
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
@@ -1155,11 +1185,13 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
+        token_final_scales: torch.Tensor,
         fc1_upper_weights: torch.Tensor,
         fc1_lower_weights: torch.Tensor,
         fc2_upper_weights: torch.Tensor,
         fc2_lower_weights: torch.Tensor,
+        fc1_biases: Optional[torch.Tensor] = None,
+        fc2_biases: Optional[torch.Tensor] = None,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
@@ -1184,6 +1216,7 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
     )
 
 
+@flashinfer_api
 def cutlass_dual_weight_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -1192,6 +1225,8 @@ def cutlass_dual_weight_fused_moe(
     fc1_lower_weights: torch.Tensor,
     fc2_upper_weights: torch.Tensor,
     fc2_lower_weights: torch.Tensor,
+    fc1_biases: Optional[torch.Tensor] = None,
+    fc2_biases: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.float16,
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
@@ -1269,6 +1304,22 @@ def cutlass_dual_weight_fused_moe(
         raise ValueError("fc1 upper and lower weights must have the same shape.")
     if fc2_upper_weights.shape != fc2_lower_weights.shape:
         raise ValueError("fc2 upper and lower weights must have the same shape.")
+    if fc1_biases is not None:
+        check_shape_dtype_device(
+            fc1_biases,
+            (fc1_upper_weights.shape[0], fc1_upper_weights.shape[1]),
+            output_dtype,
+            input.device,
+            "fc1_biases",
+        )
+    if fc2_biases is not None:
+        check_shape_dtype_device(
+            fc2_biases,
+            (fc2_upper_weights.shape[0], fc2_upper_weights.shape[1]),
+            output_dtype,
+            input.device,
+            "fc2_biases",
+        )
 
     return get_cutlass_dual_weight_fused_moe_module().cutlass_dual_weight_fused_moe(
         output,
@@ -1279,6 +1330,8 @@ def cutlass_dual_weight_fused_moe(
         fc1_lower_weights,
         fc2_upper_weights,
         fc2_lower_weights,
+        fc1_biases,
+        fc2_biases,
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,

@@ -16,11 +16,11 @@
 
 #include <cuda.h>
 
+#include "cutlass_fused_moe_kernels.cuh"
 #include "dual_weight_moe_kernels.h"
 #include "moe_kernels.h"
 #include "moe_util_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
-#include "cutlass_fused_moe_kernels.cuh"
 
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
@@ -29,7 +29,8 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 
 template <typename T, typename WeightType, typename OutputType, typename InputType,
           typename BackBoneType, typename Enable>
-DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::DualWeightMoeFCRunner() {}
+DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
+                      Enable>::DualWeightMoeFCRunner() {}
 
 template <typename T, typename WeightType, typename OutputType, typename InputType,
           typename BackBoneType, typename Enable>
@@ -132,15 +133,14 @@ template <typename T, typename WeightType, typename OutputType, typename InputTy
           typename BackBoneType, typename Enable>
 size_t
 DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::getWorkspaceSize(
-    int64_t const num_rows, int64_t const hidden_size, int64_t const fc1_output_size,
+    int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
     int const num_experts, int const experts_per_token, ActivationType activation_type,
     MOEParallelismConfig parallelism_config) {
   int const ep_size = parallelism_config.ep_size;
   TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0,
                        "Number of experts must be a multiple of ep size");
-  auto sizes_map =
-      getWorkspaceDeviceBufferSizes(num_rows, hidden_size, fc1_output_size, num_experts / ep_size,
-                                    experts_per_token, activation_type);
+  auto sizes_map = getWorkspaceDeviceBufferSizes(
+      num_rows, hidden_size, inter_size, num_experts / ep_size, experts_per_token, activation_type);
   std::vector<size_t> sizes(sizes_map.size());
   std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(),
                  [](auto& v) { return v.second.first; });
@@ -200,8 +200,8 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           class Enable>
 void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm1(
-    DualWeightMoeGemmRunner<T, WeightType, T, ScaleBiasType>& gemm_runner, T const* const input,
-    T* const output, void* const intermediate_result,
+    DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+    T const* const input, T* const output, void* const intermediate_result,
     int64_t const* const expert_first_token_offset,
     WeightType const* const fc1_upper_expert_weights,
     WeightType const* const fc1_lower_expert_weights, ScaleBiasType const* const fc1_expert_biases,
@@ -228,7 +228,7 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
     universal_input.scales = nullptr;
     universal_input.zeros = nullptr;
     universal_input.biases = fc1_expert_biases;
-    universal_input.C = reinterpret_cast<T*>(output);
+    universal_input.C = reinterpret_cast<OutputType*>(output);
     universal_input.alpha_scales = nullptr;
     universal_input.occupancy = nullptr;
     universal_input.activation_type = fc1_activation_type.activation_type;
@@ -259,10 +259,13 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
     universal_input.scales = nullptr;
     universal_input.zeros = nullptr;
     universal_input.biases = fc1_expert_biases;
-    universal_input.C = static_cast<T*>(use_ampere_activation_fusion ? output : intermediate_result);
+    universal_input.C =
+        static_cast<OutputType*>(use_ampere_activation_fusion ? output : intermediate_result);
     universal_input.alpha_scales = nullptr;
     universal_input.occupancy = nullptr;
-    universal_input.activation_type = use_ampere_activation_fusion ? fc1_activation_type.activation_type : ActivationType::Identity;
+    universal_input.activation_type = use_ampere_activation_fusion
+                                          ? fc1_activation_type.activation_type
+                                          : ActivationType::Identity;
     universal_input.num_rows = expanded_num_rows;
     universal_input.n = int64_t(fc1_out_size);
     universal_input.k = hidden_size;
@@ -291,12 +294,12 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           class Enable>
 void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm2(
-    DualWeightMoeGemmRunner<T, WeightType, T, ScaleBiasType>& gemm_runner, T const* const input,
-    void* const gemm_output, OutputType* const final_output,
+    DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+    T const* const input, void* const gemm_output, OutputType* const final_output,
     int64_t const* const expert_first_token_offset,
     WeightType const* const fc2_expert_upper_weights,
     WeightType const* const fc2_expert_lower_weights, ScaleBiasType const* const fc2_expert_biases,
-    float const* const token_topk_unpermuted_scales, float const* const token_topk_permuted_scales,
+    float const* const unpermuted_final_scales, float const* const permuted_final_scales,
     int const* const unpermuted_row_to_permuted_row, int const* permuted_row_to_unpermuted_row,
     int const* const token_selected_experts, int64_t const* const num_valid_tokens_ptr,
     int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
@@ -333,11 +336,11 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
   sync_check_cuda_error(stream);
 
   // Finalize: unpermute and scale outputs
-  finalizeMoeRoutingKernelLauncher<OutputType, T>(
-      static_cast<T const*>(gemm_output), final_output, fc2_expert_biases,
-      token_topk_unpermuted_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
-      token_selected_experts, expert_first_token_offset, num_rows, hidden_size, hidden_size,
-      experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall,
+  finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
+      static_cast<T const*>(gemm_output), final_output, fc2_expert_biases, unpermuted_final_scales,
+      unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
+      expert_first_token_offset, num_rows, hidden_size, hidden_size, experts_per_token,
+      num_experts_per_node, parallelism_config, enable_alltoall,
       /*enable_pdl*/ false, stream);
 
   sync_check_cuda_error(stream);
@@ -350,11 +353,11 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
     float const* token_final_scales, void const* fc1_upper_expert_weights_void,
     void const* fc1_lower_expert_weights_void, void const* fc1_expert_biases_void,
     ActivationParams fc1_activation_type, void const* fc2_upper_expert_weights_void,
-    void const* fc2_lower_expert_weights_void, void const* fc2_expert_biases_void, int64_t const num_rows,
-    int64_t const hidden_size, int64_t const inter_size, int const full_num_experts,
-    int const experts_per_token, char* workspace_ptr, void* final_output_void,
-    int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
-    bool const enable_alltoall, cudaStream_t stream) {
+    void const* fc2_lower_expert_weights_void, void const* fc2_expert_biases_void,
+    int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
+    int const full_num_experts, int const experts_per_token, char* workspace_ptr,
+    void* final_output_void, int* unpermuted_row_to_permuted_row,
+    MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream) {
   auto const* input_activations = static_cast<InputType const*>(input_activations_void);
   auto const* fc1_upper_expert_weights =
       static_cast<WeightType const*>(fc1_upper_expert_weights_void);
@@ -381,15 +384,35 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
+  // For NoSmem epilogue schedule, we need to align the output of the GEMM to 256 bits, for gated
+  // activation this is automatic if the usual alignment requirement is met
+  if (gemm1_config_->epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM &&
+      !isGatedActivation(fc1_activation_type)) {
+    TLLM_CHECK_WITH_INFO(
+        inter_size % (256 / sizeof_bits<WeightType>::value) == 0,
+        "Inter size %d does not meet minimum alignment requirements for MOE GEMM %d",
+        (int)inter_size, (int)(256 / sizeof_bits<WeightType>::value));
+  }
+
+  if (gemm2_config_->epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM) {
+    TLLM_CHECK_WITH_INFO(
+        gemm2_config_->epilogue_fusion_type !=
+            cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
+        "Got NoSmem epilogue schedule, which is not supported for finalize fusion");
+    TLLM_CHECK_WITH_INFO(
+        hidden_size % (256 / sizeof_bits<WeightType>::value) == 0,
+        "Hidden size %d does not meet minimum alignment requirements for MOE GEMM %d",
+        (int)hidden_size, (int)(256 / sizeof_bits<WeightType>::value));
+  }
+
   // Require at least 128 bits of alignment for MOE GEMM
   TLLM_CHECK_WITH_INFO(
       hidden_size % (128 / sizeof_bits<WeightType>::value) == 0,
       "Hidden size %d does not meet minimum alignment requirements for MOE GEMM %d",
       (int)hidden_size, (int)(128 / sizeof_bits<WeightType>::value));
-  TLLM_CHECK_WITH_INFO(
-      inter_size % (128 / sizeof_bits<WeightType>::value) == 0,
-      "Inter size %d does not meet minimum alignment requirements for MOE GEMM %d",
-      (int)inter_size, (int)(128 / sizeof_bits<WeightType>::value));
+  TLLM_CHECK_WITH_INFO(inter_size % (128 / sizeof_bits<WeightType>::value) == 0,
+                       "Inter size %d does not meet minimum alignment requirements for MOE GEMM %d",
+                       (int)inter_size, (int)(128 / sizeof_bits<WeightType>::value));
 
   // These values must fit into an int for building the source maps
   TLLM_CHECK_WITH_INFO(num_rows <= std::numeric_limits<int>::max(), "Number of rows is too large");
@@ -403,7 +426,7 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
 
   int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
 
-  configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts_per_node, 
+  configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts_per_node,
                   experts_per_token, fc1_activation_type.activation_type, parallelism_config);
 
   int start_expert = parallelism_config.ep_rank * num_experts_per_node;
@@ -418,8 +441,8 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
   bool fused_prologue_result = false;
   fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
       token_selected_experts, permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
-      expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token,
-      start_expert, end_expert,  /*enable_pdl*/ false, stream);
+      expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token, start_expert,
+      end_expert, /*enable_pdl*/ false, stream);
 
   if (!fused_prologue_result) {
     TLLM_LOG_TRACE("Falling back to unfused prologue");
@@ -447,30 +470,30 @@ void DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, E
 
   sync_check_cuda_error(stream);
 
-  Self::gemm1(
-      moe_gemm_runner_, gemm1_input, fc1_result_, glu_inter_result_,
-      expert_first_token_offset_, fc1_upper_expert_weights, fc1_lower_expert_weights,
-      fc1_expert_biases, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
-      num_experts_per_node, fc1_activation_type,
-      /*bias_is_broadcast*/ true, stream, *gemm1_config_, /*num_active_experts_per*/ nullptr,
-      /*active_expert_global_ids*/ nullptr);
+  Self::gemm1(moe_gemm_runner_, gemm1_input, fc1_result_, glu_inter_result_,
+              expert_first_token_offset_, fc1_upper_expert_weights, fc1_lower_expert_weights,
+              fc1_expert_biases, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size,
+              inter_size, num_experts_per_node, fc1_activation_type,
+              /*bias_is_broadcast*/ true, stream, *gemm1_config_,
+              /*num_active_experts_per*/ nullptr,
+              /*active_expert_global_ids*/ nullptr);
   sync_check_cuda_error(stream);
 
   T* gemm2_input = reinterpret_cast<T*>(fc1_result_);
-  Self::gemm2(
-      moe_gemm_runner_, gemm2_input, fc2_result_, final_output, expert_first_token_offset_,
-      fc2_upper_expert_weights, fc2_lower_expert_weights, fc2_expert_biases,
-      token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
-      permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
-      expanded_num_rows, hidden_size, inter_size, num_experts_per_node, experts_per_token, stream,
-      parallelism_config, enable_alltoall, *gemm2_config_,
-      /*num_active_experts_per*/ nullptr,
-      /*active_expert_global_ids*/ nullptr);
+  Self::gemm2(moe_gemm_runner_, gemm2_input, fc2_result_, final_output, expert_first_token_offset_,
+              fc2_upper_expert_weights, fc2_lower_expert_weights, fc2_expert_biases,
+              token_topk_unpermuted_scales, permuted_token_final_scales_,
+              unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+              token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+              hidden_size, inter_size, num_experts_per_node, experts_per_token, stream,
+              parallelism_config, enable_alltoall, *gemm2_config_,
+              /*num_active_experts_per*/ nullptr,
+              /*active_expert_global_ids*/ nullptr);
   sync_check_cuda_error(stream);
 }
 
-std::map<std::string, std::pair<size_t, size_t>> DualWeightGemmProfilerBackend::getProfilerWorkspaces(
-    int maxM) {
+std::map<std::string, std::pair<size_t, size_t>>
+DualWeightGemmProfilerBackend::getProfilerWorkspaces(int maxM) {
   size_t k = mK;
   size_t num_expanded_tokens = maxM * k;
 
@@ -587,7 +610,7 @@ std::map<std::string, std::pair<size_t, size_t>> DualWeightGemmProfilerBackend::
 }
 
 void DualWeightGemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_char,
-                                         cudaStream_t stream) {
+                                                   cudaStream_t stream) {
   auto workspaces = getProfilerWorkspaces(num_tokens);
 #define GET_WS_PTR_BASE(type, name)                                                   \
   auto* name##_base =                                                                 \
@@ -619,7 +642,7 @@ void DualWeightGemmProfilerBackend::prepareRouting(int num_tokens, char* workspa
   uint32_t num_threads = 256;
   dim3 grid_dim{(num_tokens + num_threads - 1) / num_threads, NUM_ROUTING_SAMPLES, 1};
   prepareFakeRouterBuffers<<<grid_dim, num_threads, 0, stream>>>(token_selected_experts_base,
-                                                                  num_tokens, mK, mNumExperts);
+                                                                 num_tokens, mK, mNumExperts);
   sync_check_cuda_error(stream);
 
   for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++) {
@@ -634,17 +657,14 @@ void DualWeightGemmProfilerBackend::prepareRouting(int num_tokens, char* workspa
     threeStepBuildExpertMapsSortFirstToken(
         token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
         unpermuted_row_to_permuted_row, expert_first_token_offset, blocked_expert_counts,
-        blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
-        mNumExpertsPerNode, mK, start_expert_id, /*enable_pdl*/ false, stream);
+        blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens, mNumExpertsPerNode,
+        mK, start_expert_id, /*enable_pdl*/ false, stream);
     sync_check_cuda_error(stream);
   }
 }
 
 void DualWeightGemmProfilerBackend::prepare(int num_tokens, char* workspace_ptr_char,
-                                  void const* upper_expert_weights,
-                                  void const* lower_expert_weights,
-                                  cudaStream_t stream) {
-  mAllTacticsSaved = mInterface->getTactics();
+                                            cudaStream_t stream) {
   mSampleIndex = 0;
 
   auto workspace_size = getWorkspaceSize(num_tokens);
@@ -664,9 +684,10 @@ size_t DualWeightGemmProfilerBackend::getWorkspaceSize(int maxM) {
 }
 
 void DualWeightGemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tactic,
-                                      char* workspace_ptr_char, void const* upper_expert_weights,
-                                      void const* lower_expert_weights,
-                                      cudaStream_t const& stream) {
+                                                char* workspace_ptr_char,
+                                                void const* upper_expert_weights,
+                                                void const* lower_expert_weights,
+                                                cudaStream_t const& stream) {
   int64_t expanded_num_tokens = original_num_tokens * mK;
   int64_t num_experts_per_node = mNumExpertsPerNode;
 
@@ -719,35 +740,52 @@ void DualWeightGemmProfilerBackend::runProfiler(int original_num_tokens, Config 
   mInterface->is_profiler = true;
   if (mGemmToProfile == GemmToProfile::GEMM_1) {
     mInterface->gemm1(
-        input,                                             //
-        output,                                            //
-        intermediate,                                      //
-        expert_first_token_offset,                         //
-        upper_weights_sel,                                 //
-        lower_weights_sel,                                 //
-        bias,                                              //
-        expert_first_token_offset + num_experts_per_node,  //
+        input,                                                                       //
+        output,                                                                      //
+        intermediate,                                                                //
+        expert_first_token_offset,                                                   //
+        upper_weights_sel,                                                           //
+        lower_weights_sel,                                                           //
+        bias,                                                                        //
+        expert_first_token_offset + num_experts_per_node,                            //
         original_num_tokens,                                                         //
         expanded_num_tokens,                                                         //
         mExpertHiddenSize,                                                           //
         mExpertInterSize,                                                            //
         num_experts_per_node,                                                        //
         ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit),  //
-        /*bias_is_broadcast*/ false,                                                 //
+        /*bias_is_broadcast*/ true,                                                  //
         stream,                                                                      //
         tactic,                                                                      //
         num_active_experts_per_node,                                                 //
         active_expert_global_ids);                                                   //
   } else {
     TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
-    mInterface->gemm2(
-        input, intermediate, output, expert_first_token_offset, upper_weights_sel, lower_weights_sel,
-        bias, token_topk_unpermuted_scales, token_topk_permuted_scales,
-        unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
-        expert_first_token_offset + mNumExpertsPerNode, original_num_tokens, expanded_num_tokens,
-        mExpertHiddenSize, mExpertInterSize, num_experts_per_node, mK,
-        stream, mParallelismConfig, mEnableAlltoall, tactic,
-        num_active_experts_per_node, active_expert_global_ids);
+    mInterface->gemm2(input,                                           //
+                      intermediate,                                    //
+                      output,                                          //
+                      expert_first_token_offset,                       //
+                      upper_weights_sel,                               //
+                      lower_weights_sel,                               //
+                      bias,                                            //
+                      token_topk_unpermuted_scales,                    //
+                      token_topk_permuted_scales,                      //
+                      unpermuted_row_to_permuted_row,                  //
+                      permuted_row_to_unpermuted_row,                  //
+                      token_selected_experts,                          //
+                      expert_first_token_offset + mNumExpertsPerNode,  //
+                      original_num_tokens,                             //
+                      expanded_num_tokens,                             //
+                      mExpertHiddenSize,                               //
+                      mExpertInterSize,                                //
+                      num_experts_per_node,                            //
+                      mK,                                              //
+                      stream,                                          //
+                      mParallelismConfig,                              //
+                      mEnableAlltoall,                                 //
+                      tactic,                                          //
+                      num_active_experts_per_node,                     //
+                      active_expert_global_ids);                       //
   }
   mInterface->is_profiler = false;
 

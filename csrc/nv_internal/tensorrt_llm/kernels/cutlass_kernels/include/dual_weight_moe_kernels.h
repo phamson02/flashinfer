@@ -150,7 +150,7 @@ class DualWeightMoeFCRunner : public DualWeightMoeFCRunnerInterface {
               cudaStream_t stream) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-  static void gemm1(DualWeightMoeGemmRunner<T, WeightType, T, ScaleBiasType>& gemm_runner,
+  static void gemm1(DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
                     T const* const input, T* const output, void* const intermediate_result,
                     int64_t const* const expert_first_token_offset,
                     WeightType const* const fc1_upper_expert_weights,
@@ -164,8 +164,8 @@ class DualWeightMoeFCRunner : public DualWeightMoeFCRunnerInterface {
                     int* num_active_experts_per, int* active_expert_global_ids);
 
   static void gemm2(
-      DualWeightMoeGemmRunner<T, WeightType, T, ScaleBiasType>& gemm_runner, T const* const input,
-      void* const gemm_output, OutputType* const final_output,
+      DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+      T const* const input, void* const gemm_output, OutputType* const final_output,
       int64_t const* const expert_first_token_offset,
       WeightType const* const fc2_expert_upper_weights,
       WeightType const* const fc2_expert_lower_weights,
@@ -246,7 +246,7 @@ class DualWeightMoeFCRunner : public DualWeightMoeFCRunnerInterface {
   std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config_;
   std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config_;
 
-  DualWeightMoeGemmRunner<T, WeightType, T, ScaleBiasType> moe_gemm_runner_;
+  DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
 
   // Pointers
   int* permuted_row_to_unpermuted_row_{};
@@ -294,9 +294,7 @@ struct DualWeightGemmProfilerBackend {
     mSM = common::getSMVersion();
   }
 
-  void prepare(int num_tokens, char* workspace, void const* upper_expert_weights,
-               void const* lower_expert_weights,
-               cudaStream_t stream);
+  void prepare(int num_tokens, char* workspace, cudaStream_t stream);
 
   std::map<std::string, std::pair<size_t, size_t>> getProfilerWorkspaces(int maxM);
   size_t getWorkspaceSize(int maxM);
