@@ -844,6 +844,13 @@ void threeStepBuildExpertMapsSortFirstToken(
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+  int64_t const num_expanded_tokens = num_tokens * num_experts_per_token;
+
+  // Initialize routing map to an invalid sentinel so missing writes are observable and do not reuse
+  // stale values from prior launches/cudagraph replays.
+  check_cuda_error(cudaMemsetAsync(unpermuted_row_to_permuted_row, 0xFF,
+                                   static_cast<size_t>(num_expanded_tokens * sizeof(int)),
+                                   stream));
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
                        num_tokens, num_experts_per_node, num_experts_per_token,
