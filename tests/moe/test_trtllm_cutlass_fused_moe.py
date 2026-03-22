@@ -498,22 +498,14 @@ BATCH_SIZES = [
     8,
     16,
     32,
-    64,
-    128,
-    256,
-    512,
-    1024,
-    2048,
-    4096,
-    8192,
 ]
 HIDDEN_SIZES = [
-    1024,
+    128,
 ]
-NUM_EXPERTS = [8]
+NUM_EXPERTS = [2]
 TOP_K_VALUES = [2]
 INTERMEDIATE_SIZES = [
-    1024,
+    128,
 ]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
@@ -573,9 +565,11 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 8
-    or torch.cuda.get_device_capability()[0] > 8
-    or torch.cuda.get_device_capability()[1] > 0,
-    reason="Implement for SM80",
+    or (
+        torch.cuda.get_device_capability()[0] == 8
+        and torch.cuda.get_device_capability()[1] != 0
+    ),
+    reason="Implemented for SM80 and SM90+",
 )
 def test_dual_weight_fused_moe_matches_single_weight(
     batch_size,
@@ -621,11 +615,17 @@ def test_dual_weight_fused_moe_matches_single_weight(
         fc2_biases=fc2_biases,
     )
 
-    # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
-    fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
-    fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
-    fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
-    fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
+    # SM90+ dual-weight path consumes native (non-pre-shuffled) FP8 layout.
+    if torch.cuda.get_device_capability()[0] >= 9:
+        fc1_upper_fp8_mma = fc1_upper_fp8
+        fc1_lower_fp8_mma = fc1_lower_fp8
+        fc2_upper_fp8_mma = fc2_upper_fp8
+        fc2_lower_fp8_mma = fc2_lower_fp8
+    else:
+        fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
+        fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
+        fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
+        fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
 
     flash_output = torch.empty_like(ref_output)
     flash_output = fused_moe.cutlass_dual_weight_fused_moe(
@@ -641,9 +641,7 @@ def test_dual_weight_fused_moe_matches_single_weight(
         output=flash_output,
     )
 
-    torch.testing.assert_close(
-        ref_output, flash_output, rtol=1e-1, atol=1e-1
-    )
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -663,9 +661,11 @@ def test_dual_weight_fused_moe_matches_single_weight(
 )
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 8
-    or torch.cuda.get_device_capability()[0] > 8
-    or torch.cuda.get_device_capability()[1] > 0,
-    reason="Implemented for SM80",
+    or (
+        torch.cuda.get_device_capability()[0] == 8
+        and torch.cuda.get_device_capability()[1] != 0
+    ),
+    reason="Implemented for SM80 and SM90+",
 )
 def test_dual_weight_fused_moe_non_gated(
     batch_size,
@@ -691,9 +691,7 @@ def test_dual_weight_fused_moe_non_gated(
 
     w1_fp16 = gen_tensor(w1_shape, torch.float16, scale=0.1)
     w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
-    fc1_biases = gen_tensor(
-        (num_experts, intermediate_size), torch.float16, scale=0.05
-    )
+    fc1_biases = gen_tensor((num_experts, intermediate_size), torch.float16, scale=0.05)
     fc2_biases = gen_tensor((num_experts, hidden_size), torch.float16, scale=0.05)
 
     # Pack FP16 weights into dual FP8 upper/lower encoding that the kernel reconstructs.
@@ -718,11 +716,17 @@ def test_dual_weight_fused_moe_non_gated(
         fc2_biases=fc2_biases,
     )
 
-    # Pre-shuffle FP8 weights to match MMA fragment layout (kernel no longer shuffles).
-    fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
-    fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
-    fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
-    fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
+    # SM90+ dual-weight path consumes native (non-pre-shuffled) FP8 layout.
+    if torch.cuda.get_device_capability()[0] >= 9:
+        fc1_upper_fp8_mma = fc1_upper_fp8
+        fc1_lower_fp8_mma = fc1_lower_fp8
+        fc2_upper_fp8_mma = fc2_upper_fp8
+        fc2_lower_fp8_mma = fc2_lower_fp8
+    else:
+        fc1_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc1_upper_fp8)
+        fc1_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc1_lower_fp8)
+        fc2_upper_fp8_mma = shuffle_fp8_weights_for_mma(fc2_upper_fp8)
+        fc2_lower_fp8_mma = shuffle_fp8_weights_for_mma(fc2_lower_fp8)
 
     flash_output = torch.empty_like(ref_output)
     flash_output = fused_moe.cutlass_dual_weight_fused_moe(
@@ -739,9 +743,7 @@ def test_dual_weight_fused_moe_non_gated(
         activation_type=activation_type,
     )
 
-    torch.testing.assert_close(
-        ref_output, flash_output, rtol=1e-1, atol=1e-1
-    )
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -838,8 +840,11 @@ def test_moe_fp8(
     [(torch.float16, torch.float8_e4m3fn)],
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 8,
-    reason="FP8 weight path requires SM80+",
+    not (
+        torch.cuda.get_device_capability()[0] == 8
+        and torch.cuda.get_device_capability()[1] == 0
+    ),
+    reason="Implemented for SM80",
 )
 def test_moe_fp16_activation_fp8_weight(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype

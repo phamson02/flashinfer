@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "../include/moe_gemm_kernels.h"
+#include "../include/dual_weight_moe_gemm_kernels.h"
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
 #include "cutlass/cutlass.h"
@@ -177,6 +177,47 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const {
        << "\n";
   }
 
+  return ss.str();
+}
+
+std::array<size_t, 21> DualWeightTmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+    int num_experts, FpXBlockScalingType scaling_type) {
+  auto base_buffers = TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(num_experts, scaling_type);
+  std::array<size_t, 21> buffers{};
+  for (size_t i = 0; i < base_buffers.size(); ++i) {
+    buffers[i] = base_buffers[i];
+  }
+  buffers[20] = sizeof(void*) * num_experts;
+  return buffers;
+}
+
+size_t DualWeightTmaWarpSpecializedGroupedGemmInput::workspaceSize(
+    int num_experts, FpXBlockScalingType scaling_type) {
+  auto buffers = workspaceBuffers(num_experts, scaling_type);
+  return tensorrt_llm::common::calculateTotalWorkspaceSize(buffers.data(), buffers.size());
+}
+
+void DualWeightTmaWarpSpecializedGroupedGemmInput::configureWorkspace(
+    int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size,
+    FpXBlockScalingType scaling_type) {
+  auto base_buffers = TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(num_experts, scaling_type);
+  int8_t* ptr_weight_2_buf = start_ptr;
+  for (auto const& buffer_size : base_buffers) {
+    ptr_weight_2_buf = tensorrt_llm::common::nextWorkspacePtr(ptr_weight_2_buf, buffer_size);
+  }
+
+  TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
+      start_ptr, num_experts, gemm_workspace, gemm_workspace_size, scaling_type);
+  ptr_weight_2 = reinterpret_cast<void const**>(ptr_weight_2_buf);
+}
+
+std::string DualWeightTmaWarpSpecializedGroupedGemmInput::toString() const {
+  std::stringstream ss;
+  ss << TmaWarpSpecializedGroupedGemmInput::toString();
+  if (isValid()) {
+    using PrintType = void const*;
+    ss << "Ptr Weight 2: " << (PrintType)ptr_weight_2 << "\n";
+  }
   return ss.str();
 }
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

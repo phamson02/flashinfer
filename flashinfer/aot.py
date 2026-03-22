@@ -58,6 +58,7 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
+    gen_cutlass_dual_weight_fused_moe_sm90_module,
     gen_cutlass_dual_weight_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -489,6 +490,7 @@ def gen_all_modules(
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            jit_specs.append(gen_cutlass_dual_weight_fused_moe_sm90_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())

@@ -34,6 +34,7 @@ from ..jit import (
     setup_cubin_loader,
 )
 from ..jit.fused_moe import (
+    gen_cutlass_dual_weight_fused_moe_sm90_module,
     gen_cutlass_dual_weight_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -948,10 +949,19 @@ def cutlass_fused_moe(
 
 
 @functools.cache
-def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
-    module = gen_cutlass_dual_weight_fused_moe_sm80_module(
-        use_fast_build
-    ).build_and_load()
+def get_cutlass_dual_weight_fused_moe_module(
+    backend: str = "80", use_fast_build: bool = False
+):
+    if backend == "90":
+        module = gen_cutlass_dual_weight_fused_moe_sm90_module(
+            use_fast_build
+        ).build_and_load()
+    elif backend == "80":
+        module = gen_cutlass_dual_weight_fused_moe_sm80_module(
+            use_fast_build
+        ).build_and_load()
+    else:
+        raise ValueError(f"Invalid backend: {backend}")
 
     class DualWeightMoERunner(TunableRunner):
         runner_dict: Dict[Tuple[torch.dtype, torch.dtype, torch.dtype], Any] = dict()
@@ -979,6 +989,8 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             cluster_size: int,
             cluster_rank: int,
             enable_alltoall: bool,
+            min_latency_mode: bool,
+            enable_pdl: bool,
             activation_type: ActivationType,
         ):
             self.top_k = top_k
@@ -989,6 +1001,8 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             self.cluster_size = cluster_size
             self.cluster_rank = cluster_rank
             self.enable_alltoall = enable_alltoall
+            self.min_latency_mode = min_latency_mode
+            self.enable_pdl = enable_pdl
             instance_key = (
                 x_dtype,
                 weight_dtype,
@@ -1059,9 +1073,11 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
                 self.cluster_size,
                 self.cluster_rank,
                 self.enable_alltoall,
+                self.min_latency_mode,
                 kwargs["gemm_idx"],
                 tactic,
                 do_preparation,
+                self.enable_pdl,
                 self.activation_type,
             )
 
@@ -1108,11 +1124,9 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
-    ) -> torch.Tensor:
-        if min_latency_mode:
-            raise NotImplementedError(
-                "Min latency mode is not supported for dual-weight MoE."
-            )
+    ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
         tuner = AutoTuner.get()
         DualWeightMoERunner.refine_tuning_config(tune_max_num_tokens)
 
@@ -1129,6 +1143,8 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
             enable_alltoall=enable_alltoall,
+            min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
         # Limit tactics to GEMM1 during tuning
@@ -1166,7 +1182,33 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             gemm_idx=2,
         )
 
-        run_moe = moe_runner.fused_moe_runner.run_moe_dual_weight
+        run_moe = (
+            moe_runner.fused_moe_runner.run_moe_dual_weight
+            if min_latency_mode
+            else moe_runner.fused_moe_runner.run_moe_dual_weight
+        )
+        num_active_experts_per_node = torch.empty(
+            (1,), dtype=torch.int32, device=input.device
+        )
+        experts_to_token_score = torch.empty(
+            (fc2_upper_weights.shape[0], input.shape[0]),
+            dtype=torch.float32,
+            device=input.device,
+        )
+        active_expert_global_ids = torch.empty(
+            (fc2_upper_weights.shape[0],),
+            dtype=torch.int32,
+            device=input.device,
+        )
+        min_latency_output = (
+            [
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+            if min_latency_mode
+            else []
+        )
         run_moe(
             output,
             input,
@@ -1181,6 +1223,7 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            *min_latency_output,
             tp_size,
             tp_rank,
             ep_size,
@@ -1193,7 +1236,16 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
             enable_pdl,
             activation_type,
         )
-        return output
+        return (
+            output
+            if min_latency_mode
+            else [
+                output,
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+        )
 
     @register_fake_op("flashinfer::cutlass_dual_weight_fused_moe")
     def _fake_cutlass_dual_weight_fused_moe(
@@ -1224,7 +1276,20 @@ def get_cutlass_dual_weight_fused_moe_module(use_fast_build: bool = False):
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_upper_weights.shape[1]
-        return input.new_empty([seq_len, hidden_size], dtype=output.dtype)
+    
+        if min_latency_mode:
+            num_experts_on_rank = fc2_upper_weights.shape[0]
+            output_shape = [seq_len * num_experts_on_rank, hidden_size]
+            experts_to_token_score_shape = [num_experts_on_rank, seq_len]
+            active_expert_global_ids_shape = [num_experts_on_rank]
+            return [
+                input.new_empty(output_shape, dtype=output.dtype),
+                input.new_empty([1], dtype=torch.int32),
+                input.new_empty(experts_to_token_score_shape, dtype=torch.float32),
+                input.new_empty(active_expert_global_ids_shape, dtype=torch.int32),
+            ]
+        else:
+            return [input.new_empty([seq_len, hidden_size], dtype=output.dtype)]
 
     return SimpleNamespace(
         cutlass_dual_weight_fused_moe=cutlass_dual_weight_fused_moe,
@@ -1260,20 +1325,22 @@ def cutlass_dual_weight_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (8, 0):
-        raise RuntimeError("Dual-weight fused MoE is only available on SM80 GPUs.")
+    device_arch = f"{major * 10 + minor}"
+
     if min_latency_mode:
-        raise NotImplementedError(
-            "min latency mode not supported for dual-weight fused MoE."
-        )
+        raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
+
     if output_dtype != torch.float16:
         raise NotImplementedError(
             "Only float16 output is supported for dual-weight fused MoE."
         )
 
     num_rows = input.shape[0]
+    if min_latency_mode:
+        num_rows *= fc2_upper_weights.shape[0]
     hidden_size = fc2_upper_weights.shape[1]
     output_shape = (num_rows, hidden_size)
 
@@ -1336,7 +1403,9 @@ def cutlass_dual_weight_fused_moe(
             "fc2_biases",
         )
 
-    return get_cutlass_dual_weight_fused_moe_module().cutlass_dual_weight_fused_moe(
+    return get_cutlass_dual_weight_fused_moe_module(
+        device_arch
+    ).cutlass_dual_weight_fused_moe(
         output,
         input,
         token_selected_experts,
@@ -1356,11 +1425,11 @@ def cutlass_dual_weight_fused_moe(
         ep_rank,
         cluster_size,
         cluster_rank,
-        enable_alltoall,
-        min_latency_mode,
-        tune_max_num_tokens,
-        enable_pdl,
-        activation_type,
+        enable_alltoall=enable_alltoall,
+        min_latency_mode=min_latency_mode,
+        tune_max_num_tokens=tune_max_num_tokens,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
     )
 
 

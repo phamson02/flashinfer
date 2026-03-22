@@ -33,6 +33,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     enum_type,
     get_device,
+    is_close_stats,
     print_perf_metrics,
     filter_backends_by_compute_capability,
 )
@@ -461,6 +462,59 @@ def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
     return out, scale.view((1,))
 
 
+def _reconstruct_fp16_from_dual_fp8(
+    upper_fp8: torch.Tensor, lower_fp8: torch.Tensor
+) -> torch.Tensor:
+    upper_u8 = upper_fp8.view(torch.uint8)
+    lower_u8 = lower_fp8.view(torch.uint8)
+    sign = upper_u8 & 0x80
+    sub = (lower_u8 & 0x80) >> 7
+    packed_upper = ((upper_u8 - sub) >> 1) & 0x3F
+    packed_upper |= sign
+    raw_i32 = (packed_upper.to(torch.int32) << 8) | lower_u8.to(torch.int32)
+    return raw_i32.to(torch.uint16).view(torch.float16)
+
+
+def _moe_reference_swiglu_local(
+    x: torch.Tensor,
+    w31_local: torch.Tensor,
+    w2_local: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    expert_start: int,
+) -> torch.Tensor:
+    # Reference computes this rank's local contribution only (respecting EP/TP sharding).
+    batch_size, hidden_size = x.shape
+    out = torch.zeros(batch_size, hidden_size, device=x.device, dtype=torch.float32)
+    x_f32 = x.to(torch.float32)
+    w31_f32 = w31_local.to(torch.float32)
+    w2_f32 = w2_local.to(torch.float32)
+    routing_f32 = routing_weights.to(torch.float32)
+
+    inter2 = w31_f32.shape[1]
+    inter = inter2 // 2
+    selected_experts_i64 = selected_experts.to(torch.int64)
+    local_num_experts = w31_f32.shape[0]
+    expert_end = expert_start + local_num_experts
+
+    for token_idx in range(batch_size):
+        for topk_idx in range(selected_experts_i64.shape[1]):
+            expert_id = int(selected_experts_i64[token_idx, topk_idx].item())
+            if expert_id < expert_start or expert_id >= expert_end:
+                continue
+            local_expert_id = expert_id - expert_start
+            w3 = w31_f32[local_expert_id, :inter, :]
+            w1 = w31_f32[local_expert_id, inter:, :]
+            w2 = w2_f32[local_expert_id]
+            w1_out = x_f32[token_idx] @ w1.T
+            w3_out = x_f32[token_idx] @ w3.T
+            act = torch.nn.functional.silu(w1_out) * w3_out
+            expert_out = act @ w2.T
+            out[token_idx] += routing_f32[token_idx, topk_idx] * expert_out
+
+    return out.to(x.dtype)
+
+
 def testTrtllmFp4BlockScaleMoe(args):
     """
     Test trtllm_fp4_block_scale_moe API (TensorRT-LLM fused MoE).
@@ -841,6 +895,7 @@ def testCutlassFusedMoe(args):
     tp_rank = getattr(args, "tp_rank", 0)
     ep_size = getattr(args, "ep_size", 1)
     ep_rank = getattr(args, "ep_rank", 0)
+    run_refcheck = args.refcheck
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
     backends = ["cutlass"]
@@ -910,6 +965,11 @@ def testCutlassFusedMoe(args):
     # Prepare variant-specific inputs (outside of the timed/captured region)
     variant = getattr(args, "cutlass_variant", "base")
     out = torch.empty_like(x)
+    reference_x = None
+    reference_w31 = None
+    reference_w2 = None
+    refcheck_rtol = 1e-1
+    refcheck_atol = 1e-1
 
     if variant == "base":
 
@@ -937,6 +997,9 @@ def testCutlassFusedMoe(args):
             w2_local,
             out,
         )
+        reference_x = x
+        reference_w31 = w31_local
+        reference_w2 = w2_local
 
     elif variant == "fp8":
         # Per-tensor FP8 for weights and activation scale
@@ -1004,6 +1067,18 @@ def testCutlassFusedMoe(args):
             w2_weight_fp8,
             out,
         )
+        hidden_states_scale_cast = hidden_states_scale_scalar.to(
+            device=device, dtype=input_dtype
+        )
+        reference_x = x_quant.to(input_dtype) * hidden_states_scale_cast
+        reference_w31 = w31_weight_fp8.to(input_dtype) * w31_scales[:, 0].view(
+            local_num_experts, 1, 1
+        )
+        reference_w2 = w2_weight_fp8.to(input_dtype) * w2_scales[:, 0].view(
+            local_num_experts, 1, 1
+        )
+        refcheck_rtol = 1e-1
+        refcheck_atol = 1e-1
 
     elif variant == "nvfp4":
         # NVFP4: FP4 block-scale weights, optional quantized input
@@ -1088,10 +1163,41 @@ def testCutlassFusedMoe(args):
             w2_q,
             out,
         )
+        # NVFP4 benchmark path uses packed FP4 + block scales. Keep refcheck disabled
+        # here until dequantized reference is wired for this packed format.
+        reference_x = None
+        reference_w31 = None
+        reference_w2 = None
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
     backend = "cutlass"
+    has_reference_output = False
+    reference_output = None
+    if run_refcheck:
+        if (
+            reference_x is not None
+            and reference_w31 is not None
+            and reference_w2 is not None
+        ):
+            reference_output = _moe_reference_swiglu_local(
+                reference_x,
+                reference_w31,
+                reference_w2,
+                routing_weights,
+                selected_experts,
+                expert_start,
+            )
+            has_reference_output = True
+        else:
+            print(
+                f"[WARNING] Refcheck is not enabled for cutlass_variant={variant}; skipping output validation."
+            )
+
+    validated_output = None
+    if run_refcheck:
+        run_cutlass(*input_args_for_bench)
+        validated_output = out.detach().clone()
 
     # Optional autotune warmup (supported for CUTLASS fused MoE)
     if getattr(args, "autotune", False):
@@ -1116,6 +1222,29 @@ def testCutlassFusedMoe(args):
         cold_l2_cache=True,
         input_args=input_args_for_bench,
     )
+
+    if run_refcheck and has_reference_output:
+        (
+            num_different_elements,
+            num_elements,
+            num_different_elements_percentage,
+        ) = is_close_stats(
+            reference_output,
+            validated_output,
+            rtol=refcheck_rtol,
+            atol=refcheck_atol,
+        )
+        if num_different_elements > 0:
+            print(
+                "[ERROR] Output tensor mismatch from backend cutlass: "
+                f"{num_different_elements}/{num_elements} "
+                f"({num_different_elements_percentage:.4f}%)"
+            )
+            if not args.allow_output_mismatch:
+                raise AssertionError(
+                    "[ERROR] Backend cutlass output mismatch with "
+                    f"{num_different_elements} elements"
+                )
 
     median_time = np.median(times)
     std_time = np.std(times)
@@ -1696,6 +1825,7 @@ def testCutlassDualWeightFusedMoe(args):
     tp_rank = getattr(args, "tp_rank", 0)
     ep_size = getattr(args, "ep_size", 1)
     ep_rank = getattr(args, "ep_rank", 0)
+    run_refcheck = args.refcheck
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
     backends = ["cutlass"]
@@ -1765,14 +1895,51 @@ def testCutlassDualWeightFusedMoe(args):
     # Pack FP16 weights into nested FP8 upper/lower for dual-weight kernels
     fc1_upper, fc1_lower = _pack_fp16_to_nested_fp8_dual(w31_local)
     fc2_upper, fc2_lower = _pack_fp16_to_nested_fp8_dual(w2_local)
-    fc1_upper = shuffle_fp8_weights_for_mma(fc1_upper)
-    fc1_lower = shuffle_fp8_weights_for_mma(fc1_lower)
-    fc2_upper = shuffle_fp8_weights_for_mma(fc2_upper)
-    fc2_lower = shuffle_fp8_weights_for_mma(fc2_lower)
+    # Keep native layout for reference reconstruction.
+    fc1_upper_native, fc1_lower_native = fc1_upper, fc1_lower
+    fc2_upper_native, fc2_lower_native = fc2_upper, fc2_lower
+    major, minor = torch.cuda.get_device_capability(device)
+    if major == 8 and minor == 0:
+        fc1_upper = shuffle_fp8_weights_for_mma(fc1_upper)
+        fc1_lower = shuffle_fp8_weights_for_mma(fc1_lower)
+        fc2_upper = shuffle_fp8_weights_for_mma(fc2_upper)
+        fc2_lower = shuffle_fp8_weights_for_mma(fc2_lower)
+    elif args.verbose >= 2:
+        print(
+            f"[VVERBOSE] Skip dual-weight FP8 pre-shuffle on SM{major}{minor}; native layout is expected."
+        )
 
     out = torch.empty_like(x)
+    validated_output = None
+    has_reference_output = False
+    reference_output = None
+    if run_refcheck:
+        w31_reconstructed = _reconstruct_fp16_from_dual_fp8(
+            fc1_upper_native, fc1_lower_native
+        )
+        w2_reconstructed = _reconstruct_fp16_from_dual_fp8(
+            fc2_upper_native, fc2_lower_native
+        )
+        reference_output = _moe_reference_swiglu_local(
+            x,
+            w31_reconstructed,
+            w2_reconstructed,
+            routing_weights,
+            selected_experts,
+            expert_start,
+        )
+        has_reference_output = True
 
-    def run_cutlass():
+    def run_cutlass(
+        x,
+        selected_experts,
+        routing_weights,
+        fc1_upper,
+        fc1_lower,
+        fc2_upper,
+        fc2_lower,
+        out,
+    ):
         return cutlass_dual_weight_fused_moe(
             x,
             selected_experts.to(torch.int),
@@ -1786,17 +1953,25 @@ def testCutlassDualWeightFusedMoe(args):
             tp_rank=tp_rank,
             ep_size=ep_size,
             ep_rank=ep_rank,
-            cluster_size=1,
-            cluster_rank=0,
             output=out,
-            enable_alltoall=False,
-            min_latency_mode=False,
-            tune_max_num_tokens=num_tokens,
-            enable_pdl=False,
-            activation_type=ActivationType.Swiglu,
         )
 
+    input_args_for_bench = (
+        x,
+        selected_experts,
+        routing_weights,
+        fc1_upper,
+        fc1_lower,
+        fc2_upper,
+        fc2_lower,
+        out,
+    )
+
     backend = "cutlass"
+
+    if run_refcheck:
+        run_cutlass(*input_args_for_bench)
+        validated_output = out.detach().clone()
 
     # Optional autotune warmup (supported for CUTLASS fused MoE)
     if getattr(args, "autotune", False):
@@ -1810,20 +1985,37 @@ def testCutlassDualWeightFusedMoe(args):
             )
         with autotune(True):
             for _ in range(warmup_iters):
-                run_cutlass()
+                run_cutlass(*input_args_for_bench)
 
     # Measure
     times = bench_gpu_time(
         fn=run_cutlass,
         dry_run_iters=args.dry_run_iters,
         repeat_iters=args.num_iters,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=device,
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        cold_l2_cache=True,
+        input_args=input_args_for_bench,
     )
+
+    if run_refcheck and has_reference_output:
+        (
+            num_different_elements,
+            num_elements,
+            num_different_elements_percentage,
+        ) = is_close_stats(reference_output, validated_output, rtol=2e-1, atol=3e-1)
+        if num_different_elements > 0:
+            print(
+                "[ERROR] Output tensor mismatch from backend cutlass: "
+                f"{num_different_elements}/{num_elements} "
+                f"({num_different_elements_percentage:.4f}%)"
+            )
+            if not args.allow_output_mismatch:
+                raise AssertionError(
+                    "[ERROR] Backend cutlass output mismatch with "
+                    f"{num_different_elements} elements"
+                )
 
     median_time = np.median(times)
     std_time = np.std(times)

@@ -238,6 +238,52 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
+        if getattr(operation, "dual_weight", False):
+            # Dual-weight grouped MoE GEMM
+            # This mirrors the single-weight generation flow but emits the dual-weight macro.
+            assert operation.mainloop_schedule in [
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum,
+            ]
+            arch_tag = f"Sm{operation.arch}"
+            weight_tag = CudaTypeName[operation.weight_type]
+            assert operation.epi_fusion is not None
+            epi_fusion = EpiFusion[operation.epi_fusion]
+
+            # We need to remove the '::' because this will break the instantiation macro.
+            epi_fusion = epi_fusion.split(":")[-1]
+            epi_tag_dual = epi_tag.split(":")[-1]
+            epi_sched_dual = epi_sched.split(":")[-1]
+            epi_sched_dual = epi_sched_dual.replace(
+                "1Sm", ""
+            )  # Keep behavior aligned with single-weight path.
+
+            guard_map = {
+                e2m1: "defined(ENABLE_FP4)",
+                DataType.e4m3: "defined(ENABLE_FP8)",
+                DataType.bf16: "defined(ENABLE_BF16)",
+            }
+            guard_act = guard_map.get(operation.act_type, "1")
+            guard_weight = guard_map.get(operation.weight_type, "1")
+
+            is_mx_fpx = str(operation.is_mx_fpx).lower()
+            use_dynamic_cga = str(operation.dynamic_cga).lower()
+            use_bias = str(False).lower()
+            swap_ab = str(operation.swap_ab).lower()
+
+            instantiation = f"""
+#if {guard_act} && {guard_weight}
+        INSTANTIATE_DUAL_WEIGHT_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
+        {epi_sched_dual}, {epi_tag_dual}, {epi_fusion},
+        {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]},
+        {is_mx_fpx}, {use_dynamic_cga}, {use_bias}, {swap_ab}, false);
+        INSTANTIATE_DUAL_WEIGHT_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
+        {epi_sched_dual}, {epi_tag_dual}, {epi_fusion},
+        {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]},
+        {is_mx_fpx}, {use_dynamic_cga}, {use_bias}, {swap_ab}, true);
+#endif"""
+            return instantiation
+
         if operation.act_type != operation.weight_type and (
             operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
         ):
@@ -744,6 +790,69 @@ def generate_sm90_operations(is_arch_enabled):
     return operations
 
 
+def generate_sm90_dual_weight_grouped_gemm_operations(is_arch_enabled):
+    if not is_arch_enabled:
+        return []
+    arch = 90
+    quant_ops = [TrtLlm_QuantOp.none]
+    epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
+    epi_fusions = [
+        TrtLlm_EpilogueFusion.epilogue_fusion_none,
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize,
+    ]
+    M_TILES = [128]  # Current dual-weight SM90 path supports M=128 and one M=256 shape.
+    N_TILES = [16, 32, 64, 128, 256]
+    cta_shapes_mn = list(product(M_TILES, N_TILES)) + [(256, 128)]
+    cga_shapes = product([1, 2], [1, 2], [1])
+    swap_ab = [True, False]
+    warp_shape = [0, 0, 0]  # ignored except for naming
+    stages = 0  # auto
+
+    partial_args = product(
+        quant_ops, epi_tags, epi_fusions, cta_shapes_mn, cga_shapes, swap_ab
+    )
+
+    operations = list()
+    for (
+        quant_op,
+        epi_tag,
+        epi_fusion,
+        cta_shape_mn,
+        cga_shape,
+        swap_ab,
+    ) in partial_args:
+        cta_shape_k = (128 * 8) // GetDataTypeBits(
+            DataType.f16
+        )  # dual-weight activation type is fp16
+        cta_shape_mnk = cta_shape_mn + (cta_shape_k,)
+        operation = TrtLlm_GemmLauncher(
+            GemmKind.Grouped,
+            arch,
+            DataType.f16,  # activation
+            DataType.e4m3,  # dual FP8 weight halves
+            DataType.f16,
+            DataType.f16,
+            DataType.f16,  # output
+            quant_op,
+            epi_tag,
+            cta_shape_mnk,
+            warp_shape,
+            stages,
+            cga_shape,
+            KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum,
+            None,
+            epi_fusion,
+            is_mx_fpx=False,
+            dynamic_cga=False,
+            swap_ab=swap_ab,
+        )
+        operation.dual_weight = True
+        if is_op_valid(operation):
+            operations.append(operation)
+
+    return operations
+
+
 def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
     max_k_bits = 128 * 8
     cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
@@ -1013,7 +1122,7 @@ def generate_sm80_operations(is_arch_enabled):
     return operations
 
 
-def generate_gemm_operations(output_dir, architectures):
+def generate_gemm_operations(output_dir, architectures, dual_weight=False):
     arches = architectures.split(";")
     # Get the absolute path of the provided directory
     output_dir = os.path.abspath(output_dir)
@@ -1023,6 +1132,7 @@ def generate_gemm_operations(output_dir, architectures):
     # moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
     moe_mixed_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
     # moe_mixed_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
+    dual_weight_moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/dual_weight_moe_gemm_tma_ws_launcher.inl"
     sm80_moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
     # sm80_moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
 
@@ -1046,11 +1156,14 @@ def generate_gemm_operations(output_dir, architectures):
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
-    operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-    operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
-    operations += generate_sm90_operations(has_arch(90))
-    operations += generate_sm80_operations(has_arch(80) or has_arch(89))
+    if dual_weight:
+        operations += generate_sm90_dual_weight_grouped_gemm_operations(has_arch(90))
+    else:
+        operations += generate_sm120_operations(has_arch(120) or has_arch(121))
+        operations += generate_sm103_operations(has_arch(103))
+        operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+        operations += generate_sm90_operations(has_arch(90))
+        operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 
     def should_skip(op):
         return False  # All kernels have a public implementation
@@ -1059,12 +1172,17 @@ def generate_gemm_operations(output_dir, architectures):
     def is_mixed_dtype_grouped(op):
         if isinstance(op, GemmSm80LauncherConfig):
             return False
+        if getattr(op, "dual_weight", False):
+            return False
         # Only w4a8fp8 and not wfp4afp8
         return (
             (op.act_type != op.weight_type)
             and (op.gemm_kind == GemmKind.Grouped)
             and (op.act_type != DataType.e4m3 or op.weight_type != e2m1)
         )
+
+    def is_dual_weight_grouped(op):
+        return bool(getattr(op, "dual_weight", False))
 
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8
@@ -1084,6 +1202,7 @@ def generate_gemm_operations(output_dir, architectures):
             op.cta_shape[0],
             op.arch >= 100 and (op.weight_type == e2m1 or op.is_mx_fpx),
             is_mixed_dtype_grouped(op),
+            is_dual_weight_grouped(op),
         )
         op_group = op_groups.get(dict_key, [])
         if len(op_group) == 0 or len(op_group[-1]) >= GROUP_SIZE:
@@ -1094,15 +1213,20 @@ def generate_gemm_operations(output_dir, architectures):
 
     file_list = []
     for key, value in op_groups.items():
-        gemm_kind, arch, m, block_scale, is_mixed = key
+        gemm_kind, arch, m, block_scale, is_mixed, is_dual_weight = key
         for i, op_sub_group in enumerate(value):
             out_file = os.path.join(
                 output_dir,
                 GemmKindNames[gemm_kind],
                 str(arch),
-                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}_group{i}.generated.cu",
+                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}{'_DualWeight' if is_dual_weight else ''}_group{i}.generated.cu",
             )
-            inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
+            if is_dual_weight:
+                inl_file = [dual_weight_moe_gemm_inl]
+            elif is_mixed:
+                inl_file = [moe_mixed_gemm_inl]
+            else:
+                inl_file = inl_map[(gemm_kind, arch)]
             write_file(inl_file, op_sub_group, out_file)
             file_list.append(out_file)
 

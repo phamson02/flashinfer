@@ -838,12 +838,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         best_gemm1_profile = mAllProfiles.at(id1);
       }
 
-      // GEMM2 index: support both absolute (combined) and relative (within GEMM2 subrange) ids
+      // GEMM2 index: support both absolute (combined) and relative (within GEMM2 subrange) ids.
+      // Absolute GEMM2 indices live in [mGemm1TacticCount, mGemm1TacticCount + mGemm2TacticCount),
+      // so any id2 < mGemm1TacticCount must be relative and needs the offset.
       auto id2 = profile_ids.value()[1];
       if (id2 != -1) {
         int64_t absolute_id2 = id2;
-        // If id2 appears relative to GEMM2 subrange, offset it
-        if (id2 >= 0 && id2 < mGemm2TacticCount) {
+        if (id2 >= 0 && id2 < mGemm1TacticCount) {
           absolute_id2 = mGemm1TacticCount + id2;
         }
         TVM_FFI_ICHECK(absolute_id2 >= 0 &&

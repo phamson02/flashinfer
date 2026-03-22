@@ -82,8 +82,8 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 
     mProfiler = std::make_shared<kernels::DualWeightGemmProfilerBackend>();
-    auto gemm1_tactics = mKernelRunner->getTactics();
-    auto gemm2_tactics = mKernelRunner->getTactics();
+    auto gemm1_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_1);
+    auto gemm2_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_2);
     TVM_FFI_ICHECK(!gemm1_tactics.empty())
         << "No valid tactics available for dual-weight fused MoE";
     mGemm1TacticCount = static_cast<int64_t>(gemm1_tactics.size());
@@ -102,7 +102,7 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
                         Optional<TensorView> swiglu_limit, int64_t tp_size, int64_t tp_rank,
                         int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                         int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
-                        Optional<Array<int64_t>> profile_ids, bool /*enable_pdl*/,
+                        Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                         ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -236,7 +236,7 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
         inter_size, num_experts_total, static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        stream);
+        enable_pdl, stream);
   }
 
   int64_t getTacticNum() {
@@ -249,8 +249,9 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
                                 TensorView fc2_lower, Optional<TensorView> fc2_biases,
                                 int64_t top_k, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
                                 int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
-                                bool enable_alltoall, int64_t gemm_idx, int64_t profile_id,
-                                bool do_preparation, ActivationType activation_type) {
+                                bool enable_alltoall, bool /*min_latency_mode*/, int64_t gemm_idx,
+                                int64_t profile_id, bool do_preparation, bool enable_pdl,
+                                ActivationType activation_type) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     int64_t num_rows = input.size(0);
@@ -281,12 +282,13 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<int>(cluster_rank));
 
       bool USE_BIAS = fc1_biases.has_value() || fc2_biases.has_value();
-      bool USE_LORA = false;
+      bool NEED_WEIGHTS = false;
 
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile, nvinfer1::DataType::kHALF,
                       nvinfer1::DataType::kFP8, nvinfer1::DataType::kHALF, num_experts,
-                      static_cast<int>(top_k), hidden_size, inter_size, activation_type, USE_BIAS,
-                      USE_LORA, parallelism_config, enable_alltoall);
+                      static_cast<int>(top_k), hidden_size, hidden_size, inter_size,
+                      activation_type, USE_BIAS, NEED_WEIGHTS, parallelism_config,
+                      enable_alltoall);
 
       // Allocate workspace
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -296,12 +298,13 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
                                        DLDevice{kDLCUDA, device_id});
 
       // Prepare profiler with workspace and weights
-      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()), stream);
+      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
+                         upper_weights_ptr, lower_weights_ptr, enable_pdl, stream);
     }
 
     // Profile specific tactic
     mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mProfileWorkspace.data_ptr()),
-                           upper_weights_ptr, lower_weights_ptr, stream);
+                           upper_weights_ptr, lower_weights_ptr, enable_pdl, stream);
   }
 
   const char* kind() const final { return "dual_weight_fused_moe_runner"; }
@@ -312,12 +315,12 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc1_biases, TensorView fc2_upper, TensorView fc2_lower,
                  Optional<TensorView> fc2_biases, int64_t top_k, int64_t tp_size, int64_t tp_rank,
                  int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
-                 bool enable_alltoall, int64_t gemm_idx, int64_t tactic, bool do_preparation,
-                 int64_t base_activation_type) {
+                 bool enable_alltoall, bool min_latency_mode, int64_t gemm_idx, int64_t profile_id,
+                 bool do_preparation, bool enable_pdl, int64_t base_activation_type) {
             runGemmProfileDualWeight(input, fc1_upper, fc1_lower, fc1_biases, fc2_upper, fc2_lower,
                                      fc2_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
-                                     cluster_size, cluster_rank, enable_alltoall, gemm_idx, tactic,
-                                     do_preparation,
+                                     cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
+                                     gemm_idx, profile_id, do_preparation, enable_pdl,
                                      static_cast<ActivationType>(base_activation_type));
           });
     } else if (name == "get_tactic_num") {
@@ -378,6 +381,10 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
             : mAllProfiles.front();
     if (profile_ids.has_value()) {
       TVM_FFI_ICHECK_EQ(profile_ids.value().size(), 2) << "Expecting 2 profile ids";
+      // GEMM1 tactics occupy [0, mGemm1TacticCount).
+      // GEMM2 tactics occupy [mGemm1TacticCount, mGemm1TacticCount + mGemm2TacticCount).
+      // GEMM2 id2 supports both absolute and relative indices: any id2 < mGemm1TacticCount
+      // must be relative (within GEMM2 subrange) and gets offset by mGemm1TacticCount.
       auto id1 = profile_ids.value()[0];
       if (id1 != -1) {
         TVM_FFI_ICHECK(id1 >= 0 && id1 < mGemm1TacticCount) << "Invalid gemm1 profile id: " << id1;
@@ -387,7 +394,7 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
       auto id2 = profile_ids.value()[1];
       if (id2 != -1) {
         int64_t absolute_id2 = id2;
-        if (id2 >= 0 && id2 < mGemm2TacticCount) {
+        if (id2 >= 0 && id2 < mGemm1TacticCount) {
           absolute_id2 = mGemm1TacticCount + id2;
         }
         TVM_FFI_ICHECK(absolute_id2 >= 0 &&

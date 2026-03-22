@@ -44,6 +44,35 @@ struct DualWeightGroupedGemmInput
   DualWeightGroupedGemmInput() = default;
 };
 
+struct DualWeightTmaWarpSpecializedGroupedGemmInput
+    : public TmaWarpSpecializedGroupedGemmInput {
+  void const** ptr_weight_2 = nullptr;
+
+  bool hasLowerWeight() const { return ptr_weight_2 != nullptr; }
+
+  static std::array<size_t, 21> workspaceBuffers(int num_experts,
+                                                 FpXBlockScalingType scaling_type);
+
+  static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
+
+  void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace,
+                          size_t gemm_workspace_size, FpXBlockScalingType scaling_type);
+
+  std::string toString() const;
+};
+
+}  // namespace tensorrt_llm::kernels::cutlass_kernels
+
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/dual_weight_moe_gemm_template_dispatch_tma_ws.h"
+
+namespace tensorrt_llm::kernels::cutlass_kernels {
+
+template <typename T, typename WeightType>
+constexpr bool isValidDualWeightHopperTmaSpecialisation();
+
+template <typename T, typename WeightType, typename EpilogueTag>
+constexpr bool isValidDualWeightTmaWarpSpecializedMOESpecialisation();
+
 // Dual-weight MOE GEMM kernel launcher for FP16 activations with FP8 weights on SM80/89
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
           cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
@@ -54,7 +83,8 @@ struct genericDualWeightMoeGemmKernelLauncher {
     static_assert(std::is_same_v<T, half>, "Dual-weight MOE only supports FP16 activations");
     static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3>,
                   "Dual-weight MOE only supports FP8 E4M3 weights");
-    static_assert(arch::kMinComputeCapability == 80, "Dual-weight MOE only supports SM80");
+    static_assert(arch::kMinComputeCapability >= 80,
+                  "Dual-weight MOE only supports tensor-core architectures");
     static_assert(QuantOp == cutlass::WeightOnlyQuantOp::UNDEFINED,
                   "Dual-weight MOE does not support quantization ops");
 
@@ -72,14 +102,14 @@ struct genericDualWeightMoeGemmKernelLauncher {
       using EpilogueOp = typename tensorrt_llm::cutlass_extensions::Epilogue<
           CutlassGemmOutputType, MixedGemmArchTraits::ElementsPerAccessC, ElementAccumulator,
           EpilogueTag>::Op;
-      
+
       typename EpilogueOp::Params epilogue_op(
           ElementAccumulator(1.f),
           inputs.biases ? ElementAccumulator(1.f) : ElementAccumulator(0.f));
       using TaggedOperator =
           typename cutlass::arch::TagOperator<typename MixedGemmArchTraits::Operator,
                                               QuantOp>::TaggedOperator;
-      
+
       // Finally, set up the kernel.
       using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGroupedDualWeight<
           ElementType, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone,
@@ -94,7 +124,7 @@ struct genericDualWeightMoeGemmKernelLauncher {
       using GemmKernel =
           cutlass::gemm::kernel::MoeFCGemmDualWeight<typename GemmKernel_::Mma,
                                                      typename GemmKernel_::Epilogue,
-                                                     typename GemmKernel_::ThreadblockSwizzle, 
+                                                     typename GemmKernel_::ThreadblockSwizzle,
                                                      arch, // Ensure top level arch is used for dispatch
                                                      GemmKernel_::kGroupScheduleMode>;
 
@@ -122,7 +152,7 @@ struct genericDualWeightMoeGemmKernelLauncher {
           reinterpret_cast<CutlassGemmOutputType const*>(inputs.biases), inputs.bias_is_broadcast,
           reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert,
           inputs.n, inputs.k);
-      
+
       GemmGrouped gemm;
 
       auto can_implement = gemm.can_implement(args);
@@ -134,12 +164,13 @@ struct genericDualWeightMoeGemmKernelLauncher {
       TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,
                            "Failed to initialize dual-weight cutlass grouped gemm. Error: " +
                                std::string(cutlassGetStatusString(init_status)));
-      
+
       auto run_status = gemm.run(inputs.stream);
       TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,
                            "Failed to run dual-weight cutlass grouped gemm. Error: " +
                                std::string(cutlassGetStatusString(run_status)));
-    } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 1 &&
+    } else if constexpr (arch::kMinComputeCapability < 90 && sizeof(ElementType) == 2 &&
+                         sizeof(CutlassWeightType) == 1 &&
                          std::is_same_v<CutlassWeightType, cutlass::float_e4m3_t> &&
                          (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> ||
                           std::is_same_v<
@@ -261,13 +292,25 @@ class DualWeightMoeGemmRunner {
   static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3>,
                 "Dual-weight MOE only supports FP8 E4M3 weights");
 
-  void moeGemmBiasAct(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs);
+  void moeGemmBiasAct(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+                      DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-  void moeGemm(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs);
+  void moeGemm(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+               DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-  std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
-  static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
+  std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
+      bool supports_finalize_fusion) const;
+  static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
+      int sm, bool supports_finalize_fusion);
+  static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(
+      int sm, bool supports_finalize_fusion);
   static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
+
+  [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
+
+  [[nodiscard]] bool supportsTmaWarpSpecialized() const { return supportsTmaWarpSpecialized(sm_); }
+
+  [[nodiscard]] static bool supportsTmaWarpSpecialized(int sm);
 
   [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
                                             ActivationType activation_type, int gemm_n,
@@ -281,10 +324,12 @@ class DualWeightMoeGemmRunner {
 
  private:
   template <typename EpilogueTag>
-  void dispatchToArch(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs);
+  void dispatchToArch(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+                      DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
   template <typename EpilogueTag>
-  void runGemm(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs);
+  void runGemm(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+               DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
  private:
   int sm_{};
@@ -298,68 +343,22 @@ class DualWeightMoeGemmRunner {
 // ==================== Implementation ====================
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-int DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getSM() const {
-  return this->sm_;
-}
-
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
-    ActivationType activation_type, int gemm_n, int gemm_k) const {
-  constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false;
-  return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu) &&
-        !std::is_same_v<T, float> &&
-         (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) &&
-         ENABLE_FUSED_GATED_ACTIVATION;
-}
-
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isFusedGatedActivation(
-    cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n,
-    int gemm_k) const {
-  return supportsFusedGatedActivation(activation_type, gemm_n, gemm_k);
-}
-
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::DualWeightMoeGemmRunner() {
-  int device{-1};
-  tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
-  sm_ = tensorrt_llm::common::getSMVersion();
-  tensorrt_llm::common::check_cuda_error(
-      cudaDeviceGetAttribute(&multi_processor_count_, cudaDevAttrMultiProcessorCount, device));
-}
-
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-template <typename EpilogueTag>
-void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
-    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs) {
-  static_assert(
-      std::is_same_v<ScaleBiasType, OutputType>,
-      "Separate Scale/Bias type is not supported. This is assumed to be the gemm output type");
-
-  // Only SM80 is currently supported
-  if (sm_ >= 80 && sm_ < 90) {
-    dispatchDualWeightMoeGemmToCutlass<T, WeightType, OutputType, cutlass::arch::Sm80, EpilogueTag>(
-        inputs, multi_processor_count_);
-  } else {
-    TLLM_CHECK_WITH_INFO(
-        false, "Dual-weight MOE GEMM only supports SM80-89. Current SM: " + std::to_string(sm_));
-  }
+std::vector<cutlass_extensions::CutlassGemmConfig>
+DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
+    bool supports_finalize_fusion) const {
+  return getConfigs(sm_, supports_finalize_fusion);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs() const {
-  return getConfigs(sm_);
-}
-
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-std::vector<cutlass_extensions::CutlassGemmConfig>
-DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(int sm) {
-  if (sm >= 90) {
-    TLLM_THROW("Dual-weight MOE GEMM is not supported on SM90+");
-    return {};
-  }
-  return getAmpereConfigs(sm);
+DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(int sm,
+                                                                              bool supports_finalize_fusion) {
+  std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs =
+      getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
+  // SM80 Ampere fallback tactics do not work on SM90 for dual-weight kernels
+  // std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
+  // std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
+  return candidate_configs;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -387,6 +386,234 @@ DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConf
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+std::vector<cutlass_extensions::CutlassGemmConfig>
+DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(
+    int sm, bool supports_finalize_fusion) {
+  using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+  static constexpr auto weight_only_flag = CutlassGemmConfig::NONE;
+  static constexpr auto simt_only_flag =
+      std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
+  int const max_split_k = 1;
+  int const grouped_gemm_flag = CutlassGemmConfig::GROUPED_GEMM;
+  int const enable_blackwell = sm >= 100 ? CutlassGemmConfig::BLACKWELL : CutlassGemmConfig::NONE;
+  int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
+  static constexpr auto fp8_only_flag = CutlassGemmConfig::NONE;
+  auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
+      weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper |
+      fp8_only_flag);
+  TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper),
+                       "Blackwell and hopper flags are mutually exclusive");
+  if (sm >= 100 && sm < 120 &&
+      !tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) {
+    TLLM_LOG_TRACE(
+        "Blackwell is not supported for this configuration, not selecting any TMA WS "
+        "implementations");
+    return {};
+  }
+  if ((sm == 120 || sm == 121) &&
+      !tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
+    TLLM_LOG_TRACE(
+        "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS "
+        "implementations");
+    return {};
+  }
+  if (enable_hopper &&
+      !tensorrt_llm::kernels::cutlass_kernels::isValidDualWeightHopperTmaSpecialisation<T,
+                                                                                         WeightType>()) {
+    TLLM_LOG_TRACE(
+        "Hopper is not supported for this configuration, not selecting any TMA WS implementations");
+    return {};
+  }
+
+  std::vector<cutlass_extensions::CutlassGemmConfig> tma_ws_configs =
+      kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+
+  if (supports_finalize_fusion) {
+    // Duplicate the configs and set the epilogue fusion type to FINALIZE
+    auto finalize_configs = tma_ws_configs;
+    std::transform(finalize_configs.begin(), finalize_configs.end(),
+                   std::back_inserter(tma_ws_configs), [](auto& config) {
+                     config.epilogue_fusion_type =
+                         cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                     return config;
+                   });
+
+    // Finalize fusion is only supported for TMA epilogue schedule
+    tma_ws_configs.erase(
+        std::remove_if(
+            tma_ws_configs.begin(), tma_ws_configs.end(),
+            [](auto& config) {
+              return config.epilogue_fusion_type ==
+                         cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE &&
+                     config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM;
+            }),
+        tma_ws_configs.end());
+  }
+
+  auto swap_ab_configs = tma_ws_configs;
+  std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
+                 [](auto& config) {
+                   TLLM_CHECK_WITH_INFO(!config.swap_ab, "Swap AB is already set");
+                   config.swap_ab = true;
+                   return config;
+                 });
+
+  // Duplicate all configs (both swap_ab variants) with use_custom_schedule=true
+  if (sm == 90) {
+    auto custom_sched_configs = tma_ws_configs;
+    std::transform(custom_sched_configs.begin(), custom_sched_configs.end(),
+                   std::back_inserter(tma_ws_configs), [](auto& config) {
+                     config.use_custom_schedule = true;
+                     return config;
+                   });
+  }
+
+  return tma_ws_configs;
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecialized(
+    cutlass_extensions::CutlassGemmConfig gemm_config) const {
+  return supportsTmaWarpSpecialized() && gemm_config.is_tma_warp_specialized;
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized(
+    int sm) {
+#if defined(COMPILE_HOPPER_TMA_GROUPED_GEMMS)
+  return sm == 90;
+#else
+  (void)sm;
+  return false;
+#endif
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+int DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getSM() const {
+  return this->sm_;
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
+    ActivationType activation_type, int gemm_n, int gemm_k) const {
+  constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false;
+  return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu) &&
+        !std::is_same_v<T, float> &&
+         (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) &&
+         ENABLE_FUSED_GATED_ACTIVATION;
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isFusedGatedActivation(
+    cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n,
+    int gemm_k) const {
+  return supportsFusedGatedActivation(activation_type, gemm_n, gemm_k);
+}
+
+template <typename T, typename WeightType>
+constexpr bool isValidDualWeightHopperTmaSpecialisation() {
+  // Dual-weight Hopper path reconstructs FP16 from two FP8 E4M3 weights.
+  return std::is_same_v<T, half> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+}
+
+template <typename T, typename WeightType, typename EpilogueTag>
+constexpr bool isValidDualWeightTmaWarpSpecializedMOESpecialisation() {
+  return isValidDualWeightHopperTmaSpecialisation<T, WeightType>() &&
+         std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>;
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::DualWeightMoeGemmRunner() {
+  int device{-1};
+  tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+  sm_ = tensorrt_llm::common::getSMVersion();
+  tensorrt_llm::common::check_cuda_error(
+      cudaDeviceGetAttribute(&multi_processor_count_, cudaDevAttrMultiProcessorCount, device));
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename EpilogueTag>
+void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
+    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+    DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  static_assert(
+      std::is_same_v<ScaleBiasType, OutputType>,
+      "Separate Scale/Bias type is not supported. This is assumed to be the gemm output type");
+
+  TLLM_CHECK_WITH_INFO(sm_ >= 89 || !hopper_inputs.isValid(),
+                       "Hopper input information is set for non specialized implementation");
+  TLLM_CHECK_WITH_INFO(sm_ >= 90 || !inputs.gemm_config.is_tma_warp_specialized,
+                       "Hopper configuration provided for non-Hopper architecture");
+
+  if (sm_ >= 80 && sm_ < 90) {
+    dispatchDualWeightMoeGemmToCutlass<T, WeightType, OutputType, cutlass::arch::Sm80, EpilogueTag>(
+        inputs, multi_processor_count_);
+  } else if (sm_ >= 90) {
+    if constexpr (tensorrt_llm::kernels::cutlass_kernels::
+                      isValidDualWeightTmaWarpSpecializedMOESpecialisation<T, WeightType,
+                                                                          EpilogueTag>()) {
+      // We allow both tma warp specialized and SM80 configurations to coexist because for some
+      // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
+      if (inputs.gemm_config.sm_version >= 90) {
+        // Check the major version of the SM matches
+        TLLM_CHECK_WITH_INFO((inputs.gemm_config.sm_version / 10 == sm_ / 10) ||
+                                 // allow sm100 configs to run on sm110 as well
+                                 (inputs.gemm_config.sm_version / 10 == 10 && sm_ / 10 == 11),
+                             "Using SM %d configuration for SM %d device",
+                             inputs.gemm_config.sm_version, sm_);
+        TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,
+                             "Input biases and hopper input disagree if bias is enabled");
+        TLLM_CHECK_WITH_INFO(
+            hopper_inputs.isValid(),
+            "Calling TMA warp specialized configuration with invalid hopper config");
+
+        // Select the appropriate fusion function
+        auto select_function = [&]() {
+          switch (hopper_inputs.fusion) {
+            case DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
+              return &cutlass_kernels_oss::dispatchDualWeightMoeGemmSelectTileShapeTmaWarpSpecialized<
+                  T, WeightType, OutputType, EpilogueTag,
+                  DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE>;
+            case DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE:
+              return &cutlass_kernels_oss::dispatchDualWeightMoeGemmSelectTileShapeTmaWarpSpecialized<
+                  T, WeightType, OutputType, EpilogueTag,
+                  DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
+            case DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION:
+            case DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION:
+            default:
+              TLLM_THROW("Unimplemented fusion %d requested", (int)hopper_inputs.fusion);
+          };
+        };
+        auto selected_func = select_function();
+        selected_func(hopper_inputs, inputs.num_experts, inputs.gemm_config, multi_processor_count_,
+                      inputs.stream, inputs.occupancy, nullptr);
+        return;
+      }
+
+      // Fallthrough to SM80 impl below
+    }
+
+    // Do Ampere case instead
+    if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<
+                      T, WeightType, EpilogueTag>()) {
+      TLLM_CHECK_WITH_INFO(
+          !inputs.gemm_config.is_tma_warp_specialized,
+          "GEMM config is for SM90 configuration, but this configuration is not valid for Hppper");
+      TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == 80,
+                           "Using SM %d configuration for SM80 fallback implementation",
+                           inputs.gemm_config.sm_version);
+      dispatchDualWeightMoeGemmToCutlass<T, WeightType, OutputType,
+                                                    cutlass::arch::Sm80, EpilogueTag>(
+          inputs, multi_processor_count_);
+    } else {
+      TLLM_THROW("Configuration expects SM80 but configuration is not supported by SM80 kernels");
+    }
+  } else {
+    TLLM_THROW("Arch unsupported for MoE GEMM");
+  }
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
     int num_experts) const {
   if (num_experts_ != num_experts) {
@@ -401,42 +628,75 @@ size_t DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMax
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
     int num_experts) const {
-  // Dual-weight grouped GEMM doesn't require additional workspace beyond the input buffers
-  // The workspace is primarily used for intermediate results managed by the caller
-  return 0;
+  if (!supportsTmaWarpSpecialized()) {
+    return 0;
+  }
+
+  // Finalize fusion may not actually be supported by the kernel,
+  // if they are not we will catch the error and skip them
+  auto configs = getTmaWarpSpecializedConfigs(sm_, true);
+  auto fpX_block_scaling_type = DualWeightTmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+  size_t max_size = 0;
+  bool has_config = false;
+  for (auto conf : configs) {
+#define CALC_SIZE_FUSION(FUSION)                                                                     \
+  do {                                                                                               \
+    try {                                                                                            \
+      size_t const size =                                                                            \
+          cutlass_kernels_oss::calcMaxWorkspaceSizeDualWeightTmaWarpSpecialized<                     \
+              T, WeightType, OutputType, FUSION>(                                                    \
+              num_experts, conf, multi_processor_count_,                                             \
+              fpX_block_scaling_type);                                                               \
+      max_size = std::max(max_size, size);                                                           \
+      has_config = true;                                                                             \
+    } catch (tensorrt_llm::common::TllmException const& e) {                                         \
+      TLLM_LOG_TRACE("Unsupported dual-weight TMA config skipped for workspace size: %s", e.what()); \
+    }                                                                                                \
+  } while (0)
+
+    CALC_SIZE_FUSION(DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+    if (sm_ == 90) {
+      CALC_SIZE_FUSION(DualWeightTmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
+    }
+
+#undef CALC_SIZE_FUSION
+  }
+
+  TLLM_CHECK_WITH_INFO(has_config,
+                       "Could not find a valid dual-weight SM90 TMA config for workspace sizing");
+  return max_size;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 template <typename EpilogueTag>
 void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::runGemm(
-    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs) {
-  dispatchToArch<EpilogueTag>(inputs);
+    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+    DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  dispatchToArch<EpilogueTag>(inputs, hopper_inputs);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
-    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs) {
+    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+    DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   switch (inputs.activation_type) {
     case ActivationType::Relu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs, hopper_inputs);
       break;
     case ActivationType::Gelu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
       break;
     case ActivationType::Silu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
       break;
     case ActivationType::Identity:
-      runGemm<cutlass_extensions::EpilogueOpDefault>(inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Swiglu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
       break;
     case ActivationType::Geglu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs);
-      break;
-    case ActivationType::Relu2:
-      TLLM_THROW("Relu2 is not supported.");
+      runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
       break;
     case ActivationType::InvalidType:
       TLLM_THROW("Activation type for fpA_intB must be valid.");
@@ -449,8 +709,9 @@ void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmB
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 void DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
-    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs) {
-  runGemm<cutlass_extensions::EpilogueOpDefault>(inputs);
+    DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+    DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels
