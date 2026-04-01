@@ -22,7 +22,7 @@
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/epilogue_helpers.h"
-#include "cutlass_extensions/gemm/device/gemm_universal_base_compat.h"
+#include "cutlass/gemm/device/gemm_universal_base.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "cutlass_extensions/gemm/kernel/fpA_intB_gemm.h"
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
@@ -75,8 +75,13 @@ void generic_mixed_gemm_kernelLauncher(
 
   static_assert(cutlass::platform::is_same<ActivationType, WeightType>::value ||
                     cutlass::platform::is_same<WeightType, uint8_t>::value ||
-                    cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
-                "");
+                    cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value ||
+#ifdef ENABLE_FP8
+                    cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value ||
+                    cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value ||
+#endif
+                    false,
+                "WeightType must be uint8_t, uint4b_t, or (with ENABLE_FP8) __nv_fp8_e4m3/__nv_fp8_e5m2");
 
   // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if
   // necessary.
@@ -119,7 +124,7 @@ void generic_mixed_gemm_kernelLauncher(
     return;
   }
 
-  using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
+  using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
 
   int const ldb = cutlass::platform::is_same<cutlass::layout::RowMajor,
                                              typename MixedGemmArchTraits::LayoutB>::value

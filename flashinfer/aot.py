@@ -69,6 +69,8 @@ from .jit.fused_moe import (
 )
 from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.gemm import (
+    gen_dual_weight_gemm_sm80_module,
+    gen_mixed_mm_sm80_module,
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
@@ -482,6 +484,8 @@ def gen_all_modules(
     if add_moe:
         jit_specs.append(gen_gemm_module())
         if has_sm80:
+            jit_specs.append(gen_dual_weight_gemm_sm80_module())
+            jit_specs.append(gen_mixed_mm_sm80_module())
             jit_specs.append(gen_cutlass_fused_moe_sm80_module())
             jit_specs.append(gen_cutlass_dual_weight_fused_moe_sm80_module())
         if has_sm90:

@@ -6,6 +6,14 @@ from .gemm_base import mm_bf16 as mm_bf16
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
+from .gemm_base import dual_weight_mm as dual_weight_mm
+from .gemm_base import prepare_dual_weight_mm_weights as prepare_dual_weight_mm_weights
+from .gemm_base import dual_weight_mm_e5m2 as dual_weight_mm_e5m2
+from .gemm_base import prepare_dual_weight_mm_weights_e5m2 as prepare_dual_weight_mm_weights_e5m2
+from .gemm_base import dual_weight_mm_e5m2_trunc as dual_weight_mm_e5m2_trunc
+from .gemm_base import prepare_mixed_mm_weights as prepare_mixed_mm_weights
+from .gemm_base import mixed_mm_e4m3 as mixed_mm_e4m3
+from .gemm_base import mixed_mm_e5m2 as mixed_mm_e5m2
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
 from .gemm_base import group_gemm_mxfp4_nt_groupwise as group_gemm_mxfp4_nt_groupwise
 from .gemm_base import (
@@ -54,6 +62,14 @@ __all__ = [
     "mm_fp4",
     "mm_fp8",
     "mm_mxfp8",
+    "dual_weight_mm",
+    "prepare_dual_weight_mm_weights",
+    "dual_weight_mm_e5m2",
+    "prepare_dual_weight_mm_weights_e5m2",
+    "dual_weight_mm_e5m2_trunc",
+    "prepare_mixed_mm_weights",
+    "mixed_mm_e4m3",
+    "mixed_mm_e5m2",
     "tgv_gemm_sm100",
     "group_gemm_mxfp4_nt_groupwise",
     "batch_deepgemm_fp8_nt_groupwise",

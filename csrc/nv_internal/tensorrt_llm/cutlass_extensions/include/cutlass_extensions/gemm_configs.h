@@ -326,6 +326,9 @@ struct CutlassGemmConfig {
   ClusterShape dynamic_cluster_shape = ClusterShape::Undefined;
   ClusterShape fallback_cluster_shape = ClusterShape::Undefined;
   bool enableCudaKernel = false;
+  // When true, issue MMA(k) before transform(k+1) so reconstruction integer
+  // ops can overlap with the tensor-core pipeline (SM80 k-block interleaving).
+  bool kblock_interleaved = false;
   int sm_version = 80;  // Use 80 as a catch all for <90
   bool is_tma_warp_specialized = false;
 

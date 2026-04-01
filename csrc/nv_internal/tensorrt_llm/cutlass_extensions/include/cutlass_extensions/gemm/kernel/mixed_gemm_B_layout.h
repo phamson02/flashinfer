@@ -74,6 +74,20 @@ struct LayoutDetailsB<TypeA, cutlass::float_e4m3_t, arch::Sm80, Enable> {
   using Operator = cutlass::arch::OpMultiplyAddMixedInputUpcast;
 };
 
+template <typename TypeA, typename Enable>
+struct LayoutDetailsB<TypeA, cutlass::float_e5m2_t, arch::Sm80, Enable> {
+  static constexpr int ThreadblockK = 64;
+
+ private:
+  static constexpr int ElementsPerCacheLine = 128 * 8 / sizeof_bits<uint8_t>::value;
+  static constexpr int ColumnsInterleaved = ElementsPerCacheLine / ThreadblockK;
+
+ public:
+  using Layout = layout::ColumnMajor;
+  static constexpr int ElementsPerAccess = 128 / cutlass::sizeof_bits<cutlass::float_e5m2_t>::value;
+  using Operator = cutlass::arch::OpMultiplyAddMixedInputUpcast;
+};
+
 template <typename TypeA>
 struct LayoutDetailsB<TypeA, cutlass::float_e4m3_t, arch::Sm89> {
   static constexpr int ThreadblockK = 64;

@@ -44,6 +44,8 @@ from ..utils import (
     backend_requirement,
     supported_compute_capability,
 )
+from ..jit.gemm import gen_dual_weight_gemm_sm80_module
+from ..jit.gemm import gen_mixed_mm_sm80_module
 from ..jit.gemm import gen_gemm_sm90_module
 from ..jit.gemm import gen_gemm_module
 from ..jit.gemm import gen_gemm_sm100_module
@@ -186,6 +188,1015 @@ def get_gemm_module():
     )
 
     return _gemm_module
+
+
+@functools.cache
+def get_dual_weight_gemm_sm80_module():
+    module = gen_dual_weight_gemm_sm80_module().build_and_load()
+
+    @register_custom_op("flashinfer::dual_weight_mm_sm80", mutates_args=("out",))
+    def dual_weight_mm_sm80(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm80(
+            a,
+            w_upper,
+            w_lower,
+            out,
+            workspace_buffer,
+            tactic,
+        )
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm80")
+    def _fake_dual_weight_mm_sm80(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    @register_custom_op(
+        "flashinfer::dual_weight_mm_sm80_e5m2_trunc", mutates_args=("out",)
+    )
+    def dual_weight_mm_sm80_e5m2_trunc(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm80_e5m2_trunc(
+            a,
+            w_upper,
+            w_lower,
+            out,
+            workspace_buffer,
+            tactic,
+        )
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm80_e5m2_trunc")
+    def _fake_dual_weight_mm_sm80_e5m2_trunc(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    @register_custom_op("flashinfer::dual_weight_mm_sm80_e5m2", mutates_args=("out",))
+    def dual_weight_mm_sm80_e5m2(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm80_e5m2(
+            a,
+            w_upper,
+            w_lower,
+            out,
+            workspace_buffer,
+            tactic,
+        )
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm80_e5m2")
+    def _fake_dual_weight_mm_sm80_e5m2(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    def dual_weight_mm_runner():
+        class CutlassDualWeightMmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.dual_weight_mm_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm80(
+                    a,
+                    w_upper,
+                    w_lower,
+                    out,
+                    workspace_buffer,
+                    tactic,
+                )
+                return out
+
+        return CutlassDualWeightMmRunner()
+
+    def dual_weight_mm_e5m2_trunc_runner():
+        class CutlassDualWeightMmE5M2TruncRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.dual_weight_mm_e5m2_trunc_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm80_e5m2_trunc(
+                    a,
+                    w_upper,
+                    w_lower,
+                    out,
+                    workspace_buffer,
+                    tactic,
+                )
+                return out
+
+        return CutlassDualWeightMmE5M2TruncRunner()
+
+    def dual_weight_mm_e5m2_runner():
+        class CutlassDualWeightMmE5M2Runner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.dual_weight_mm_e5m2_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm80_e5m2(
+                    a,
+                    w_upper,
+                    w_lower,
+                    out,
+                    workspace_buffer,
+                    tactic,
+                )
+                return out
+
+        return CutlassDualWeightMmE5M2Runner()
+
+    return SimpleNamespace(
+        dual_weight_mm_runner=dual_weight_mm_runner,
+        dual_weight_mm_sm80=dual_weight_mm_sm80,
+        dual_weight_mm_e5m2_runner=dual_weight_mm_e5m2_runner,
+        dual_weight_mm_sm80_e5m2=dual_weight_mm_sm80_e5m2,
+        dual_weight_mm_e5m2_trunc_runner=dual_weight_mm_e5m2_trunc_runner,
+        dual_weight_mm_sm80_e5m2_trunc=dual_weight_mm_sm80_e5m2_trunc,
+    )
+
+
+def _check_row_major_matrix(x: torch.Tensor, name: str) -> None:
+    if x.ndim != 2:
+        raise ValueError(f"{name} must be a 2D tensor, got shape {tuple(x.shape)}.")
+    if x.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must be row-major with contiguous last dimension, got stride {tuple(x.stride())}."
+        )
+
+
+def _check_column_major_matrix(x: torch.Tensor, name: str) -> None:
+    if x.ndim != 2:
+        raise ValueError(f"{name} must be a 2D tensor, got shape {tuple(x.shape)}.")
+    if x.stride(0) != 1:
+        raise ValueError(
+            f"{name} must be column-major with contiguous leading dimension, got stride {tuple(x.stride())}."
+        )
+
+
+def _shuffle_fp8_weights_for_mma_column_major(weight_fp8: torch.Tensor) -> torch.Tensor:
+    k, n = weight_fp8.shape
+    if k % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {k}.")
+
+    weight_u8 = weight_fp8.view(torch.uint8)
+    leading_dim = weight_u8.stride(1)
+
+    # Column-major (k, n) shares storage layout with logical row-major (n, k).
+    row_major_view = torch.as_strided(weight_u8, size=(n, k), stride=(leading_dim, 1))
+    reshaped = torch.as_strided(
+        row_major_view,
+        size=(n, k // 16, 4, 4),
+        stride=(leading_dim, 16, 4, 1),
+    )
+
+    shuffled = torch.empty_strided(
+        (k, n),
+        (1, k),
+        device=weight_fp8.device,
+        dtype=weight_fp8.dtype,
+    )
+    shuffled_u8 = shuffled.view(torch.uint8)
+    shuffled_row_major = torch.as_strided(
+        shuffled_u8,
+        size=(n, k),
+        stride=(shuffled_u8.stride(1), 1),
+    )
+    shuffled_reshaped = torch.as_strided(
+        shuffled_row_major,
+        size=(n, k // 16, 4, 4),
+        stride=(shuffled_u8.stride(1), 16, 4, 1),
+    )
+
+    shuffled_reshaped[:, :, 0, 0] = reshaped[:, :, 0, 0]
+    shuffled_reshaped[:, :, 0, 1] = reshaped[:, :, 0, 1]
+    shuffled_reshaped[:, :, 0, 2] = reshaped[:, :, 2, 0]
+    shuffled_reshaped[:, :, 0, 3] = reshaped[:, :, 2, 1]
+
+    shuffled_reshaped[:, :, 1, 0] = reshaped[:, :, 0, 2]
+    shuffled_reshaped[:, :, 1, 1] = reshaped[:, :, 0, 3]
+    shuffled_reshaped[:, :, 1, 2] = reshaped[:, :, 2, 2]
+    shuffled_reshaped[:, :, 1, 3] = reshaped[:, :, 2, 3]
+
+    shuffled_reshaped[:, :, 2, 0] = reshaped[:, :, 1, 0]
+    shuffled_reshaped[:, :, 2, 1] = reshaped[:, :, 1, 1]
+    shuffled_reshaped[:, :, 2, 2] = reshaped[:, :, 3, 0]
+    shuffled_reshaped[:, :, 2, 3] = reshaped[:, :, 3, 1]
+
+    shuffled_reshaped[:, :, 3, 0] = reshaped[:, :, 1, 2]
+    shuffled_reshaped[:, :, 3, 1] = reshaped[:, :, 1, 3]
+    shuffled_reshaped[:, :, 3, 2] = reshaped[:, :, 3, 2]
+    shuffled_reshaped[:, :, 3, 3] = reshaped[:, :, 3, 3]
+
+    return shuffled
+
+
+def prepare_dual_weight_mm_weights(
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Prepare dual-weight FP8-E4M3 weights for SM80 ``dual_weight_mm``.
+
+    Parameters
+    ----------
+    w_upper: torch.Tensor
+        Upper dual-weight tensor, shape ``(k, n)``, fp8-e4m3, column-major.
+
+    w_lower: torch.Tensor
+        Lower dual-weight tensor, shape ``(k, n)``, fp8-e4m3, column-major.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Prepared upper/lower weights with the same public ``(k, n)`` column-major contract.
+    """
+    if w_upper.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"w_upper must have dtype torch.float8_e4m3fn, got {w_upper.dtype}."
+        )
+    if w_lower.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"w_lower must have dtype torch.float8_e4m3fn, got {w_lower.dtype}."
+        )
+    if w_upper.device != w_lower.device:
+        raise ValueError(
+            f"w_upper and w_lower must be on the same device, got {w_upper.device} and {w_lower.device}."
+        )
+    if w_upper.shape != w_lower.shape:
+        raise ValueError(
+            f"w_upper and w_lower must have identical shapes, got {tuple(w_upper.shape)} and {tuple(w_lower.shape)}."
+        )
+
+    _check_column_major_matrix(w_upper, "w_upper")
+    _check_column_major_matrix(w_lower, "w_lower")
+
+    if w_upper.shape[0] % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {w_upper.shape[0]}.")
+
+    prepared_upper = _shuffle_fp8_weights_for_mma_column_major(w_upper)
+    prepared_lower = _shuffle_fp8_weights_for_mma_column_major(w_lower)
+    return prepared_upper, prepared_lower
+
+
+@supported_compute_capability([80])
+def _dual_weight_mm_requirement(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+):
+    if a.dtype != torch.float16:
+        raise ValueError(f"a must have dtype torch.float16, got {a.dtype}.")
+    if w_upper.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"w_upper must have dtype torch.float8_e4m3fn, got {w_upper.dtype}."
+        )
+    if w_lower.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"w_lower must have dtype torch.float8_e4m3fn, got {w_lower.dtype}."
+        )
+
+    _check_row_major_matrix(a, "a")
+    _check_column_major_matrix(w_upper, "w_upper")
+    _check_column_major_matrix(w_lower, "w_lower")
+
+    if a.device != w_upper.device or a.device != w_lower.device:
+        raise ValueError("a, w_upper, and w_lower must be on the same device.")
+    if w_upper.shape != w_lower.shape:
+        raise ValueError(
+            f"w_upper and w_lower must have identical shapes, got {tuple(w_upper.shape)} and {tuple(w_lower.shape)}."
+        )
+    if a.shape[1] != w_upper.shape[0]:
+        raise ValueError(
+            f"Shape mismatch. Expected a.shape[1] == w_upper.shape[0], got {a.shape[1]} and {w_upper.shape[0]}."
+        )
+    if w_upper.shape[0] % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {w_upper.shape[0]}.")
+
+    expected_shape = (a.shape[0], w_upper.shape[1])
+    if out is not None:
+        if out.dtype != torch.float16:
+            raise ValueError(f"out must have dtype torch.float16, got {out.dtype}.")
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_shape}, got {tuple(out.shape)}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        _check_row_major_matrix(out, "out")
+    return True
+
+
+_SM80_GEMM_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (-2,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            3,
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+@backend_requirement(
+    {},
+    common_check=_dual_weight_mm_requirement,
+)
+@flashinfer_api
+def dual_weight_mm(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM80 dual-weight matrix multiplication.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape ``(m, k)``, float16 in row-major layout.
+
+    w_upper: torch.Tensor
+        Upper dual-weight tensor, shape ``(k, n)``, fp8-e4m3 in column-major layout.
+        On SM80 this must already be prepared with
+        :func:`prepare_dual_weight_mm_weights`.
+
+    w_lower: torch.Tensor
+        Lower dual-weight tensor, shape ``(k, n)``, fp8-e4m3 in column-major layout.
+        On SM80 this must already be prepared with
+        :func:`prepare_dual_weight_mm_weights`.
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+    """
+
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]),
+            device=a.device,
+            dtype=torch.float16,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_sm80_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_dual_weight_gemm_sm80_module().dual_weight_mm_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_sm80",
+        runners,
+        _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+def prepare_dual_weight_mm_weights_e5m2(
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Prepare dual-weight FP8-E5M2 weights for SM80 ``dual_weight_mm_e5m2``.
+
+    Parameters
+    ----------
+    w_upper: torch.Tensor
+        Upper dual-weight tensor, shape ``(k, n)``, fp8-e5m2, column-major.
+
+    w_lower: torch.Tensor
+        Lower dual-weight tensor, shape ``(k, n)``, fp8-e5m2, column-major.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Prepared upper/lower weights with the same public ``(k, n)`` column-major contract.
+    """
+    if w_upper.dtype != torch.float8_e5m2:
+        raise ValueError(
+            f"w_upper must have dtype torch.float8_e5m2, got {w_upper.dtype}."
+        )
+    if w_lower.dtype != torch.float8_e5m2:
+        raise ValueError(
+            f"w_lower must have dtype torch.float8_e5m2, got {w_lower.dtype}."
+        )
+    if w_upper.device != w_lower.device:
+        raise ValueError(
+            f"w_upper and w_lower must be on the same device, got {w_upper.device} and {w_lower.device}."
+        )
+    if w_upper.shape != w_lower.shape:
+        raise ValueError(
+            f"w_upper and w_lower must have identical shapes, got {tuple(w_upper.shape)} and {tuple(w_lower.shape)}."
+        )
+
+    _check_column_major_matrix(w_upper, "w_upper")
+    _check_column_major_matrix(w_lower, "w_lower")
+
+    if w_upper.shape[0] % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {w_upper.shape[0]}.")
+
+    prepared_upper = _shuffle_fp8_weights_for_mma_column_major(w_upper)
+    prepared_lower = _shuffle_fp8_weights_for_mma_column_major(w_lower)
+    return prepared_upper, prepared_lower
+
+
+@supported_compute_capability([80])
+def _dual_weight_mm_e5m2_requirement(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+):
+    if a.dtype != torch.float16:
+        raise ValueError(f"a must have dtype torch.float16, got {a.dtype}.")
+    if w_upper.dtype != torch.float8_e5m2:
+        raise ValueError(
+            f"w_upper must have dtype torch.float8_e5m2, got {w_upper.dtype}."
+        )
+    if w_lower.dtype != torch.float8_e5m2:
+        raise ValueError(
+            f"w_lower must have dtype torch.float8_e5m2, got {w_lower.dtype}."
+        )
+
+    _check_row_major_matrix(a, "a")
+    _check_column_major_matrix(w_upper, "w_upper")
+    _check_column_major_matrix(w_lower, "w_lower")
+
+    if a.device != w_upper.device or a.device != w_lower.device:
+        raise ValueError("a, w_upper, and w_lower must be on the same device.")
+    if w_upper.shape != w_lower.shape:
+        raise ValueError(
+            f"w_upper and w_lower must have identical shapes, got {tuple(w_upper.shape)} and {tuple(w_lower.shape)}."
+        )
+    if a.shape[1] != w_upper.shape[0]:
+        raise ValueError(
+            f"Shape mismatch. Expected a.shape[1] == w_upper.shape[0], got {a.shape[1]} and {w_upper.shape[0]}."
+        )
+    if w_upper.shape[0] % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {w_upper.shape[0]}.")
+
+    expected_shape = (a.shape[0], w_upper.shape[1])
+    if out is not None:
+        if out.dtype != torch.float16:
+            raise ValueError(f"out must have dtype torch.float16, got {out.dtype}.")
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_shape}, got {tuple(out.shape)}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        _check_row_major_matrix(out, "out")
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_dual_weight_mm_e5m2_requirement,
+)
+@flashinfer_api
+def dual_weight_mm_e5m2(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM80 dual-weight matrix multiplication with FP8-E5M2 weights.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape ``(m, k)``, float16 in row-major layout.
+
+    w_upper: torch.Tensor
+        Upper dual-weight tensor, shape ``(k, n)``, fp8-e5m2 in column-major layout.
+        Must already be prepared with :func:`prepare_dual_weight_mm_weights_e5m2`.
+
+    w_lower: torch.Tensor
+        Lower dual-weight tensor, shape ``(k, n)``, fp8-e5m2 in column-major layout.
+        Must already be prepared with :func:`prepare_dual_weight_mm_weights_e5m2`.
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+    """
+
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]),
+            device=a.device,
+            dtype=torch.float16,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_e5m2_sm80_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_dual_weight_gemm_sm80_module().dual_weight_mm_e5m2_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_e5m2_sm80",
+        runners,
+        _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+@backend_requirement(
+    {},
+    common_check=_dual_weight_mm_e5m2_requirement,
+)
+@flashinfer_api
+def dual_weight_mm_e5m2_trunc(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM80 dual-weight matrix multiplication with FP8-E5M2 truncation weights.
+
+    Like :func:`dual_weight_mm_e5m2` but uses a simpler truncation encoding:
+    the upper byte is the top 8 bits of the FP16 value (exact E5M2 truncation,
+    no rounding correction) and the lower byte is the raw lower 8 bits.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape ``(m, k)``, float16 in row-major layout.
+
+    w_upper: torch.Tensor
+        Upper dual-weight tensor, shape ``(k, n)``, fp8-e5m2 in column-major layout.
+        Must already be prepared with :func:`prepare_dual_weight_mm_weights_e5m2`.
+
+    w_lower: torch.Tensor
+        Lower dual-weight tensor, shape ``(k, n)``, fp8-e5m2 in column-major layout.
+        Must already be prepared with :func:`prepare_dual_weight_mm_weights_e5m2`.
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, float16 in row-major layout.
+    """
+
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]),
+            device=a.device,
+            dtype=torch.float16,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_e5m2_trunc_sm80_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_dual_weight_gemm_sm80_module().dual_weight_mm_e5m2_trunc_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_e5m2_trunc_sm80",
+        runners,
+        _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision GEMM (SM80): FP8-weight × FP16-activation → FP16
+# B is stored as [n, k] row-major in FP8 encoding.
+# A per-output-column FP16 scale is applied in the epilogue.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def get_mixed_mm_sm80_module():
+    module = gen_mixed_mm_sm80_module().build_and_load()
+
+    @register_custom_op("flashinfer::mixed_mm_e4m3_sm80", mutates_args=("out",))
+    def mixed_mm_e4m3_sm80(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.mixed_mm_e4m3_sm80(a, b, out, workspace_buffer, tactic)
+
+    @register_fake_op("flashinfer::mixed_mm_e4m3_sm80")
+    def _fake_mixed_mm_e4m3_sm80(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    @register_custom_op("flashinfer::mixed_mm_e5m2_sm80", mutates_args=("out",))
+    def mixed_mm_e5m2_sm80(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.mixed_mm_e5m2_sm80(a, b, out, workspace_buffer, tactic)
+
+    @register_fake_op("flashinfer::mixed_mm_e5m2_sm80")
+    def _fake_mixed_mm_e5m2_sm80(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    def mixed_mm_e4m3_runner():
+        class MixedMmE4M3Runner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.mixed_mm_e4m3_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, scale, out, workspace_buffer = inputs
+                mixed_mm_e4m3_sm80(a, b, out, workspace_buffer, tactic)
+                out.mul_(scale.unsqueeze(0))
+                return out
+
+        return MixedMmE4M3Runner()
+
+    def mixed_mm_e5m2_runner():
+        class MixedMmE5M2Runner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.mixed_mm_e5m2_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, scale, out, workspace_buffer = inputs
+                mixed_mm_e5m2_sm80(a, b, out, workspace_buffer, tactic)
+                out.mul_(scale.unsqueeze(0))
+                return out
+
+        return MixedMmE5M2Runner()
+
+    return SimpleNamespace(
+        mixed_mm_e4m3_runner=mixed_mm_e4m3_runner,
+        mixed_mm_e4m3_sm80=mixed_mm_e4m3_sm80,
+        mixed_mm_e5m2_runner=mixed_mm_e5m2_runner,
+        mixed_mm_e5m2_sm80=mixed_mm_e5m2_sm80,
+    )
+
+
+def prepare_mixed_mm_weights(b: torch.Tensor) -> torch.Tensor:
+    r"""Prepare FP8 weight tensor for SM80 :func:`mixed_mm_e4m3` or :func:`mixed_mm_e5m2`.
+
+    Converts weights from the natural ``[n, k]`` row-major layout to the
+    shuffled ``[k, n]`` column-major layout required by the CUTLASS mixed-precision
+    mainloop on SM80.  This step must be performed offline (once per weight
+    matrix) before calling the GEMM.
+
+    Parameters
+    ----------
+    b : torch.Tensor
+        Weight tensor, shape ``(n, k)``, row-major, dtype float8_e4m3fn or
+        float8_e5m2.  ``k`` must be divisible by 16.
+
+    Returns
+    -------
+    torch.Tensor
+        Prepared weight tensor, shape ``(k, n)``, column-major (stride ``(1,
+        k)``), same dtype as ``b``.
+    """
+    if b.ndim != 2:
+        raise ValueError(f"b must be a 2D tensor, got shape {tuple(b.shape)}.")
+    n, k = b.shape
+    if k % 16 != 0:
+        raise ValueError(f"K must be divisible by 16, got {k}.")
+    return _shuffle_fp8_weights_for_mma_column_major(b.T)
+
+
+@supported_compute_capability([80])
+def _mixed_mm_e4m3_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+):
+    if a.dtype != torch.float16:
+        raise ValueError(f"a must have dtype torch.float16, got {a.dtype}.")
+    if b.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"b must have dtype torch.float8_e4m3fn, got {b.dtype}.")
+    if scale is not None and scale.dtype != torch.float16:
+        raise ValueError(f"scale must have dtype torch.float16, got {scale.dtype}.")
+
+    _check_row_major_matrix(a, "a")
+
+    # b must be [k, n] column-major (pre-shuffled via prepare_mixed_mm_weights).
+    if b.ndim != 2:
+        raise ValueError(f"b must be a 2D tensor, got shape {tuple(b.shape)}.")
+    if b.stride(0) != 1:
+        raise ValueError(
+            "b must be column-major ([k, n] with stride(0)=1). "
+            "Call prepare_mixed_mm_weights(b) first."
+        )
+    if a.device != b.device:
+        raise ValueError("a and b must be on the same device.")
+    k, n = b.shape
+    if a.shape[1] != k:
+        raise ValueError(
+            f"Shape mismatch: a.shape[1]={a.shape[1]} != b.shape[0]={k} (k dimension)."
+        )
+    if n % 16 != 0 or k % 16 != 0:
+        raise ValueError(
+            f"N and K must be divisible by 16, got b.shape={tuple(b.shape)}."
+        )
+
+    expected_out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.dtype != torch.float16:
+            raise ValueError(f"out must have dtype torch.float16, got {out.dtype}.")
+        if out.shape != expected_out_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_out_shape}, got {tuple(out.shape)}."
+            )
+        if out.device != a.device:
+            raise ValueError("Output device mismatch.")
+        _check_row_major_matrix(out, "out")
+    return True
+
+
+@supported_compute_capability([80])
+def _mixed_mm_e5m2_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+):
+    if a.dtype != torch.float16:
+        raise ValueError(f"a must have dtype torch.float16, got {a.dtype}.")
+    if b.dtype != torch.float8_e5m2:
+        raise ValueError(f"b must have dtype torch.float8_e5m2, got {b.dtype}.")
+    if scale is not None and scale.dtype != torch.float16:
+        raise ValueError(f"scale must have dtype torch.float16, got {scale.dtype}.")
+
+    _check_row_major_matrix(a, "a")
+
+    # b must be [k, n] column-major (pre-shuffled via prepare_mixed_mm_weights).
+    if b.ndim != 2:
+        raise ValueError(f"b must be a 2D tensor, got shape {tuple(b.shape)}.")
+    if b.stride(0) != 1:
+        raise ValueError(
+            "b must be column-major ([k, n] with stride(0)=1). "
+            "Call prepare_mixed_mm_weights(b) first."
+        )
+    if a.device != b.device:
+        raise ValueError("a and b must be on the same device.")
+    k, n = b.shape
+    if a.shape[1] != k:
+        raise ValueError(
+            f"Shape mismatch: a.shape[1]={a.shape[1]} != b.shape[0]={k} (k dimension)."
+        )
+    if n % 16 != 0 or k % 16 != 0:
+        raise ValueError(
+            f"N and K must be divisible by 16, got b.shape={tuple(b.shape)}."
+        )
+
+    expected_out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.dtype != torch.float16:
+            raise ValueError(f"out must have dtype torch.float16, got {out.dtype}.")
+        if out.shape != expected_out_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_out_shape}, got {tuple(out.shape)}."
+            )
+        if out.device != a.device:
+            raise ValueError("Output device mismatch.")
+        _check_row_major_matrix(out, "out")
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_mixed_mm_e4m3_requirement,
+)
+@flashinfer_api
+def mixed_mm_e4m3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM80 FP8-E4M3-weight × FP16-activation matrix multiplication.
+
+    B (weights) must be prepared with :func:`prepare_mixed_mm_weights`
+    before calling this function.  The prepared tensor has shape ``(k, n)`` in
+    column-major layout and uses the nested-FP E4M3 encoding decoded by the
+    CUTLASS FastNumericArrayConverter during the MMA mainloop.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Activation tensor, shape ``(m, k)``, float16, row-major.
+    b : torch.Tensor
+        Prepared weight tensor, shape ``(k, n)``, float8_e4m3fn, column-major.
+        Must be obtained from :func:`prepare_mixed_mm_weights`.
+    scale : Optional[torch.Tensor]
+        Per-output-column scale, shape ``(n,)``, float16.
+        If ``None``, a tensor of ones is used (no scaling).
+    out : Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16, row-major.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, float16.
+    """
+    n = b.shape[1]
+    if scale is None:
+        scale = torch.ones(n, device=a.device, dtype=torch.float16)
+    if out is None:
+        out = torch.empty((a.shape[0], n), device=a.device, dtype=torch.float16)
+
+    workspace_buffer = _get_cache_buf(
+        "mixed_mm_e4m3_sm80_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_mixed_mm_sm80_module().mixed_mm_e4m3_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, b, scale, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "mixed_mm_e4m3_sm80",
+        runners,
+        _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+@backend_requirement(
+    {},
+    common_check=_mixed_mm_e5m2_requirement,
+)
+@flashinfer_api
+def mixed_mm_e5m2(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM80 FP8-E5M2-weight × FP16-activation matrix multiplication.
+
+    B (weights) must be prepared with :func:`prepare_mixed_mm_weights`
+    before calling this function.  The prepared tensor has shape ``(k, n)`` in
+    column-major layout.  The kernel decodes each FP8-E5M2 byte to FP16 via a
+    left-shift by 8 (truncation encoding).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Activation tensor, shape ``(m, k)``, float16, row-major.
+    b : torch.Tensor
+        Prepared weight tensor, shape ``(k, n)``, float8_e5m2, column-major.
+        Must be obtained from :func:`prepare_mixed_mm_weights`.
+    scale : Optional[torch.Tensor]
+        Per-output-column scale, shape ``(n,)``, float16.
+        If ``None``, a tensor of ones is used (no scaling).
+    out : Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16, row-major.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, float16.
+    """
+    n = b.shape[1]
+    if scale is None:
+        scale = torch.ones(n, device=a.device, dtype=torch.float16)
+    if out is None:
+        out = torch.empty((a.shape[0], n), device=a.device, dtype=torch.float16)
+
+    workspace_buffer = _get_cache_buf(
+        "mixed_mm_e5m2_sm80_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_mixed_mm_sm80_module().mixed_mm_e5m2_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, b, scale, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "mixed_mm_e5m2_sm80",
+        runners,
+        _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
 
 
 @supported_compute_capability([100, 103])

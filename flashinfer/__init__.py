@@ -102,10 +102,22 @@ from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
+from .gemm import dual_weight_mm as dual_weight_mm
+from .gemm import dual_weight_mm_e5m2 as dual_weight_mm_e5m2
+from .gemm import dual_weight_mm_e5m2_trunc as dual_weight_mm_e5m2_trunc
+from .gemm import prepare_mixed_mm_weights as prepare_mixed_mm_weights
+from .gemm import mixed_mm_e4m3 as mixed_mm_e4m3
+from .gemm import mixed_mm_e5m2 as mixed_mm_e5m2
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import (
+    prepare_dual_weight_mm_weights as prepare_dual_weight_mm_weights,
+)
+from .gemm import (
+    prepare_dual_weight_mm_weights_e5m2 as prepare_dual_weight_mm_weights_e5m2,
+)
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm

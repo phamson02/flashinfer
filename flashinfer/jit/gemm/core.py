@@ -25,6 +25,7 @@ from .. import env as jit_env
 from ..core import (
     JitSpec,
     gen_jit_spec,
+    sm80_nvcc_flags,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
@@ -47,6 +48,75 @@ def gen_gemm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_binding.cu",
         ],
         extra_ldflags=["-lcublas", "-lcublasLt"],
+    )
+
+
+def gen_dual_weight_gemm_sm80_module() -> JitSpec:
+    return gen_jit_spec(
+        "dual_weight_gemm_sm80",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "dual_weight_gemm_sm80.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        ],
+        extra_cuda_cflags=sm80_nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP8",
+        ],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "cutlass_extensions"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "cutlass_kernels"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "cutlass_kernels",
+        ],
+    )
+
+
+def gen_mixed_mm_sm80_module() -> JitSpec:
+    _nv = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
+    return gen_jit_spec(
+        "mixed_mm_sm80",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "mixed_mm_sm80.cu",
+            _nv / "cpp/common/envUtils.cpp",
+            _nv / "cpp/common/logger.cpp",
+            _nv / "cpp/common/stringUtils.cpp",
+            _nv / "cpp/common/tllmException.cpp",
+            _nv / "cpp/common/memoryUtils.cu",
+            _nv / "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        ],
+        extra_cuda_cflags=sm80_nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP8",
+        ],
+        extra_include_paths=[
+            _nv,
+            _nv / "include",
+            _nv / "tensorrt_llm" / "cutlass_extensions" / "include",
+            _nv / "tensorrt_llm" / "kernels" / "cutlass_kernels" / "include",
+            _nv / "tensorrt_llm" / "kernels" / "cutlass_kernels",
+        ],
     )
 
 
