@@ -76,7 +76,7 @@ constexpr bool isValidDualWeightTmaWarpSpecializedMOESpecialisation();
 // Dual-weight MOE GEMM kernel launcher for FP16 activations with FP8 weights on SM80/89
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
           cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
-          typename WarpShape, int Stages>
+          typename WarpShape, int Stages, bool kKBlockInterleaved = false>
 struct genericDualWeightMoeGemmKernelLauncher {
   static void call(DualWeightGroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
                    int sm_count_) {
@@ -120,7 +120,10 @@ struct genericDualWeightMoeGemmKernelLauncher {
           ElementAccumulator, typename MixedGemmArchTraits::OperatorClass, arch, ThreadblockShape,
           WarpShape, typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
           cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, Stages,
-          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator>::GemmKernel;
+          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator,
+          cutlass::gemm::SharedMemoryClearOption::kNone,
+          cutlass::layout::NoPermute,
+          kKBlockInterleaved>::GemmKernel;
 
       using GemmKernel =
           cutlass::gemm::kernel::MoeFCGemmDualWeight<typename GemmKernel_::Mma,
@@ -197,7 +200,8 @@ struct genericDualWeightMoeGemmKernelLauncher {
 
 // Dispatch function for stages - dispatches to different stage counts
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
-          typename EpilogueTag, typename ThreadblockShape, typename WarpShape>
+          typename EpilogueTag, typename ThreadblockShape, typename WarpShape,
+          bool kKBlockInterleaved = false>
 void dispatchDualWeightGemmStages(
     DualWeightGroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_,
     int stages) {
@@ -205,20 +209,20 @@ void dispatchDualWeightGemmStages(
     case 2:
       genericDualWeightMoeGemmKernelLauncher<T, WeightType, GemmOutputType, arch,
                                              cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag,
-                                             ThreadblockShape, WarpShape, 2>::call(inputs,
-                                                                                   sm_count_);
+                                             ThreadblockShape, WarpShape, 2,
+                                             kKBlockInterleaved>::call(inputs, sm_count_);
       break;
     case 3:
       genericDualWeightMoeGemmKernelLauncher<T, WeightType, GemmOutputType, arch,
                                              cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag,
-                                             ThreadblockShape, WarpShape, 3>::call(inputs,
-                                                                                   sm_count_);
+                                             ThreadblockShape, WarpShape, 3,
+                                             kKBlockInterleaved>::call(inputs, sm_count_);
       break;
     case 4:
       genericDualWeightMoeGemmKernelLauncher<T, WeightType, GemmOutputType, arch,
                                              cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag,
-                                             ThreadblockShape, WarpShape, 4>::call(inputs,
-                                                                                   sm_count_);
+                                             ThreadblockShape, WarpShape, 4,
+                                             kKBlockInterleaved>::call(inputs, sm_count_);
       break;
     default:
       TLLM_THROW("dispatchDualWeightGemmStages does not support stages %d",
@@ -227,10 +231,10 @@ void dispatchDualWeightGemmStages(
   }
 }
 
-// Dispatch function for tile configs - matches FP16/FP16 configs from single weight
+// Tile-level dispatch; kKBlockInterleaved selects the mainloop reconstruction order.
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
-          typename EpilogueTag>
-void dispatchDualWeightMoeGemmToCutlass(
+          typename EpilogueTag, bool kKBlockInterleaved>
+void dispatchDualWeightMoeGemmTileConfig(
     DualWeightGroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     int sm_count_) {
   auto const& config = inputs.gemm_config;
@@ -240,32 +244,38 @@ void dispatchDualWeightMoeGemmToCutlass(
     case cutlass_extensions::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
       dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
                                    cutlass::gemm::GemmShape<16, 128, 64>,
-                                   cutlass::gemm::GemmShape<16, 32, 64>>(inputs, sm_count_, stages);
+                                   cutlass::gemm::GemmShape<16, 32, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
     case cutlass_extensions::CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
       dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
                                    cutlass::gemm::GemmShape<16, 256, 64>,
-                                   cutlass::gemm::GemmShape<16, 64, 64>>(inputs, sm_count_, stages);
+                                   cutlass::gemm::GemmShape<16, 64, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
     case cutlass_extensions::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
       dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
                                    cutlass::gemm::GemmShape<32, 128, 64>,
-                                   cutlass::gemm::GemmShape<32, 32, 64>>(inputs, sm_count_, stages);
+                                   cutlass::gemm::GemmShape<32, 32, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
     case cutlass_extensions::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
       dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
                                    cutlass::gemm::GemmShape<64, 128, 64>,
-                                   cutlass::gemm::GemmShape<32, 64, 64>>(inputs, sm_count_, stages);
+                                   cutlass::gemm::GemmShape<32, 64, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
     // case cutlass_extensions::CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
     //   dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
     //                                cutlass::gemm::GemmShape<64, 128, 64>,
-    //                                cutlass::gemm::GemmShape<64, 32, 64>>(inputs, sm_count_, stages);
+    //                                cutlass::gemm::GemmShape<64, 32, 64>,
+    //                                kKBlockInterleaved>(inputs, sm_count_, stages);
     //   break;
     case cutlass_extensions::CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
       dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
                                    cutlass::gemm::GemmShape<128, 128, 64>,
-                                   cutlass::gemm::GemmShape<64, 32, 64>>(inputs, sm_count_, stages);
+                                   cutlass::gemm::GemmShape<64, 32, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
     case cutlass_extensions::CutlassTileConfig::Undefined:
       TLLM_THROW("GEMM config undefined.");
@@ -276,6 +286,21 @@ void dispatchDualWeightMoeGemmToCutlass(
     default:
       TLLM_THROW("Config is invalid for same type tensorop GEMM.");
       break;
+  }
+}
+
+// Dispatch function for tile configs - branches on kblock_interleaved runtime flag.
+template <typename T, typename WeightType, typename GemmOutputType, typename arch,
+          typename EpilogueTag>
+void dispatchDualWeightMoeGemmToCutlass(
+    DualWeightGroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
+    int sm_count_) {
+  if (inputs.gemm_config.kblock_interleaved) {
+    dispatchDualWeightMoeGemmTileConfig<T, WeightType, GemmOutputType, arch, EpilogueTag, true>(
+        inputs, sm_count_);
+  } else {
+    dispatchDualWeightMoeGemmTileConfig<T, WeightType, GemmOutputType, arch, EpilogueTag, false>(
+        inputs, sm_count_);
   }
 }
 
@@ -357,9 +382,19 @@ DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(in
                                                                               bool supports_finalize_fusion) {
   std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs =
       getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
-  // SM80 Ampere fallback tactics do not work on SM90 for dual-weight kernels
-  // std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
-  // std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
+  // SM80 Ampere tactics (including k-block interleaved variants) are only valid on SM80.
+  // They do not work on SM90 for dual-weight kernels.
+  if (sm >= 80 && sm < 90) {
+    std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
+    // Duplicate ampere configs with kblock_interleaved = true
+    auto interleaved_configs = ampere_configs;
+    for (auto& cfg : interleaved_configs) {
+      cfg.kblock_interleaved = true;
+    }
+    std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
+    std::copy(interleaved_configs.begin(), interleaved_configs.end(),
+              std::back_inserter(candidate_configs));
+  }
   return candidate_configs;
 }
 
