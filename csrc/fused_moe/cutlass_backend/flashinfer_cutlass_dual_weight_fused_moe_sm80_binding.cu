@@ -54,14 +54,17 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
   DualWeightFusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype,
                            DLDataType output_dtype) {
-    // Dual-weight path is currently hard-wired to half / fp8-e4m3 / half.
+    // Dual-weight path supports half / {fp8-e4m3, fp8-e5m2} / half.
     TVM_FFI_ICHECK(activation_dtype.code == dl_float16.code &&
                    activation_dtype.bits == dl_float16.bits)
         << "Dual-weight fused MoE only supports float16 activations, got "
         << DLDataTypeToString(activation_dtype);
-    TVM_FFI_ICHECK(weight_dtype.code == dl_float8_e4m3fn.code &&
-                   weight_dtype.bits == dl_float8_e4m3fn.bits)
-        << "Dual-weight fused MoE only supports fp8-e4m3 weights, got "
+    bool is_e4m3 = (weight_dtype.code == dl_float8_e4m3fn.code &&
+                    weight_dtype.bits == dl_float8_e4m3fn.bits);
+    bool is_e5m2 = (weight_dtype.code == dl_float8_e5m2.code &&
+                    weight_dtype.bits == dl_float8_e5m2.bits);
+    TVM_FFI_ICHECK(is_e4m3 || is_e5m2)
+        << "Dual-weight fused MoE only supports fp8-e4m3 or fp8-e5m2 weights, got "
         << DLDataTypeToString(weight_dtype);
     TVM_FFI_ICHECK(output_dtype.code == dl_float16.code && output_dtype.bits == dl_float16.bits)
         << "Dual-weight fused MoE only supports float16 outputs, got "
@@ -71,8 +74,13 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
     mWeightDtype = weight_dtype;
     mOutputDtype = output_dtype;
 
-    mKernelRunner =
-        std::make_shared<kernels::DualWeightMoeFCRunner<half, __nv_fp8_e4m3, half, half>>();
+    if (is_e5m2) {
+      mKernelRunner =
+          std::make_shared<kernels::DualWeightMoeFCRunner<half, __nv_fp8_e5m2, half, half>>();
+    } else {
+      mKernelRunner =
+          std::make_shared<kernels::DualWeightMoeFCRunner<half, __nv_fp8_e4m3, half, half>>();
+    }
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)
           << "Could not construct fused moe op with the requested input combination Activation: "
@@ -117,10 +125,13 @@ class DualWeightFusedMoeRunner : public tvm::ffi::ModuleObj {
     if (token_final_scales.has_value()) {
       CHECK_INPUT_TYPE(token_final_scales.value(), dl_float32);
     }
-    CHECK_INPUT_TYPE(fc1_upper, dl_float8_e4m3fn);
-    CHECK_INPUT_TYPE(fc1_lower, dl_float8_e4m3fn);
-    CHECK_INPUT_TYPE(fc2_upper, dl_float8_e4m3fn);
-    CHECK_INPUT_TYPE(fc2_lower, dl_float8_e4m3fn);
+    // Dual-weight accepts both e4m3 and e5m2 FP8 weight types
+    TVM_FFI_ICHECK(fc1_upper.dtype() == dl_float8_e4m3fn || fc1_upper.dtype() == dl_float8_e5m2)
+        << "fc1_upper must be float8_e4m3fn or float8_e5m2, got " << DLDataTypeToString(fc1_upper.dtype());
+    auto expected_wtype = fc1_upper.dtype();
+    TVM_FFI_ICHECK(fc1_lower.dtype() == expected_wtype) << "fc1_lower dtype mismatch";
+    TVM_FFI_ICHECK(fc2_upper.dtype() == expected_wtype) << "fc2_upper dtype mismatch";
+    TVM_FFI_ICHECK(fc2_lower.dtype() == expected_wtype) << "fc2_lower dtype mismatch";
 
     CHECK_DIM(2, input);
     CHECK_DIM(2, token_selected_experts);

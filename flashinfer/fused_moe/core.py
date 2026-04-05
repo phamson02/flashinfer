@@ -1369,6 +1369,12 @@ def cutlass_dual_weight_fused_moe(
             input.device,
             "token_final_scales",
         )
+    # Dual-weight accepts both e4m3 and e5m2 FP8 weight types
+    weight_dtype = fc1_upper_weights.dtype
+    if weight_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(
+            f"Dual-weight fused MoE requires float8_e4m3fn or float8_e5m2 weights, got {weight_dtype}"
+        )
     for tensor, name in [
         (fc1_upper_weights, "fc1_upper_weights"),
         (fc1_lower_weights, "fc1_lower_weights"),
@@ -1378,7 +1384,7 @@ def cutlass_dual_weight_fused_moe(
         check_shape_dtype_device(
             tensor,
             tensor.shape,
-            torch.float8_e4m3fn,
+            weight_dtype,
             input.device,
             name,
         )

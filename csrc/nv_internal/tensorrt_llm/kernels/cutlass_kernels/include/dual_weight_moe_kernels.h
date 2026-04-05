@@ -117,8 +117,9 @@ class DualWeightMoeFCRunner : public DualWeightMoeFCRunnerInterface {
   using Self = DualWeightMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
 
   static_assert(std::is_same_v<T, half>, "Dual weight runner only supports fp16 activations");
-  static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3>,
-                "Dual weight runner only supports fp8_e4m3 weights");
+  static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3> ||
+                std::is_same_v<WeightType, __nv_fp8_e5m2>,
+                "Dual weight runner only supports fp8_e4m3 or fp8_e5m2 weights");
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;

@@ -644,6 +644,116 @@ def test_dual_weight_fused_moe_matches_single_weight(
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
 
 
+def pack_fp16_to_dual_fp8_e5m2(
+    fp16_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack FP16 weights into NestedFP E5M2 RTN dual FP8 encoding."""
+    raw = fp16_tensor.view(torch.int16).to(torch.int32)
+    upper = (raw >> 8) & 0xFF
+    lower = raw & 0xFF
+    exp = (raw >> 10) & 0x1F
+    finite_normal = ((exp != 0) & (exp != 31)).to(torch.int32)
+    inc = (
+        ((lower > 0x80) | ((lower == 0x80) & ((upper & 1) == 1))) & finite_normal.bool()
+    ).to(torch.int32)
+    stored_upper = ((upper + inc) & 0xFF).to(torch.uint8).view(torch.float8_e5m2)
+    stored_lower = torch.where(
+        finite_normal.bool(), (lower | inc).to(torch.int32), lower
+    ).to(torch.uint8).view(torch.float8_e5m2)
+    return stored_upper, stored_lower
+
+
+def reconstruct_fp16_from_dual_fp8_e5m2(
+    upper: torch.Tensor, lower: torch.Tensor
+) -> torch.Tensor:
+    """Reconstruct FP16 from NestedFP E5M2 RTN dual FP8 encoding (matches kernel logic)."""
+    upper_u8 = upper.view(torch.uint8).to(torch.int32)
+    lower_u8 = lower.view(torch.uint8).to(torch.int32)
+    exp_bits = upper_u8 & 0x7C
+    normal = (exp_bits != 0).to(torch.int32)
+    inc = lower_u8 & normal
+    upper_orig = (upper_u8 - inc) & 0xFF
+    lower_orig = lower_u8 & ~normal
+    raw = (upper_orig << 8) | lower_orig
+    return raw.to(torch.int16).view(torch.float16)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 9,
+    reason="E5M2 dual-weight fused MOE requires SM90+",
+)
+def test_dual_weight_fused_moe_e5m2_matches_single_weight(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+):
+    """Test that E5M2 dual-weight MoE matches reference with reconstructed weights."""
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(0)
+    x = gen_tensor((batch_size, hidden_size), torch.float16)
+    router_logits = gen_tensor((batch_size, num_experts), torch.float16)
+
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    # Use small values to stay within FP16 range after E5M2 RTN packing
+    w31_fp16 = gen_tensor(w31_shape, torch.float16, scale=0.1)
+    w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+    fc1_biases = gen_tensor(
+        (num_experts, 2 * intermediate_size), torch.float16, scale=0.05
+    )
+    fc2_biases = gen_tensor((num_experts, hidden_size), torch.float16, scale=0.05)
+
+    # Pack FP16 weights into E5M2 RTN dual FP8
+    fc1_upper, fc1_lower = pack_fp16_to_dual_fp8_e5m2(w31_fp16)
+    fc2_upper, fc2_lower = pack_fp16_to_dual_fp8_e5m2(w2_fp16)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Reconstruct FP16 from E5M2 dual FP8 for reference computation
+    w31_reconstructed = reconstruct_fp16_from_dual_fp8_e5m2(fc1_upper, fc1_lower)
+    w2_reconstructed = reconstruct_fp16_from_dual_fp8_e5m2(fc2_upper, fc2_lower)
+
+    ref_output = moe_reference_swiglu(
+        x,
+        w31_reconstructed,
+        w2_reconstructed,
+        routing_weights,
+        selected_experts.to(torch.int32),
+        fc1_biases=fc1_biases,
+        fc2_biases=fc2_biases,
+    )
+
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_dual_weight_fused_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        fc1_upper,
+        fc1_lower,
+        fc2_upper,
+        fc2_lower,
+        fc1_biases,
+        fc2_biases,
+        output=flash_output,
+    )
+
+
+    # E5M2 has 2 mantissa bits (vs E4M3's 3), so slightly looser tolerance
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -743,6 +853,90 @@ def test_dual_weight_fused_moe_non_gated(
         activation_type=activation_type,
     )
 
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        ActivationType.Silu,
+        ActivationType.Relu,
+        ActivationType.Gelu,
+        ActivationType.Identity,
+    ],
+    ids=["silu", "relu", "gelu", "identity"],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 9,
+    reason="E5M2 dual-weight fused MOE requires SM90+",
+)
+def test_dual_weight_fused_moe_e5m2_non_gated(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    activation_type,
+):
+    """Test that E5M2 dual-weight MoE with non-gated activations works correctly."""
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(0)
+    x = gen_tensor((batch_size, hidden_size), torch.float16)
+    router_logits = gen_tensor((batch_size, num_experts), torch.float16)
+
+    w1_shape = (num_experts, intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    w1_fp16 = gen_tensor(w1_shape, torch.float16, scale=0.1)
+    w2_fp16 = gen_tensor(w2_shape, torch.float16, scale=0.09)
+    fc1_biases = gen_tensor((num_experts, intermediate_size), torch.float16, scale=0.05)
+    fc2_biases = gen_tensor((num_experts, hidden_size), torch.float16, scale=0.05)
+
+    fc1_upper, fc1_lower = pack_fp16_to_dual_fp8_e5m2(w1_fp16)
+    fc2_upper, fc2_lower = pack_fp16_to_dual_fp8_e5m2(w2_fp16)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    w1_reconstructed = reconstruct_fp16_from_dual_fp8_e5m2(fc1_upper, fc1_lower)
+    w2_reconstructed = reconstruct_fp16_from_dual_fp8_e5m2(fc2_upper, fc2_lower)
+
+    ref_output = moe_reference_non_gated(
+        x,
+        w1_reconstructed,
+        w2_reconstructed,
+        routing_weights,
+        selected_experts.to(torch.int32),
+        activation_type,
+        fc1_biases=fc1_biases,
+        fc2_biases=fc2_biases,
+    )
+
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_dual_weight_fused_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        fc1_upper,
+        fc1_lower,
+        fc2_upper,
+        fc2_lower,
+        fc1_biases,
+        fc2_biases,
+        output=flash_output,
+        activation_type=activation_type,
+    )
+
+
+    # E5M2 has 2 mantissa bits (vs E4M3's 3), so slightly looser tolerance
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
 
 

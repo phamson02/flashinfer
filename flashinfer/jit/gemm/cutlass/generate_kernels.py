@@ -113,6 +113,7 @@ def GetDataTypeNames(type, is_mx_fpx=None):
 CudaTypeName = {
     e2m1: "SafeFP4",
     DataType.e4m3: "__nv_fp8_e4m3",
+    DataType.e5m2: "__nv_fp8_e5m2",
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half",
     DataType.f32: "float",
@@ -261,6 +262,7 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
                 DataType.e4m3: "defined(ENABLE_FP8)",
+                DataType.e5m2: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)",
             }
             guard_act = guard_map.get(operation.act_type, "1")
@@ -319,6 +321,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
                 DataType.e4m3: "defined(ENABLE_FP8)",
+                DataType.e5m2: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)",
             }
             guard_act = guard_map.get(operation.act_type, "1")
@@ -808,8 +811,10 @@ def generate_sm90_dual_weight_grouped_gemm_operations(is_arch_enabled):
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
 
+    weight_types = [DataType.e4m3, DataType.e5m2]
+
     partial_args = product(
-        quant_ops, epi_tags, epi_fusions, cta_shapes_mn, cga_shapes, swap_ab
+        quant_ops, epi_tags, epi_fusions, cta_shapes_mn, cga_shapes, swap_ab, weight_types
     )
 
     operations = list()
@@ -820,6 +825,7 @@ def generate_sm90_dual_weight_grouped_gemm_operations(is_arch_enabled):
         cta_shape_mn,
         cga_shape,
         swap_ab,
+        weight_type,
     ) in partial_args:
         cta_shape_k = (128 * 8) // GetDataTypeBits(
             DataType.f16
@@ -829,7 +835,7 @@ def generate_sm90_dual_weight_grouped_gemm_operations(is_arch_enabled):
             GemmKind.Grouped,
             arch,
             DataType.f16,  # activation
-            DataType.e4m3,  # dual FP8 weight halves
+            weight_type,  # dual FP8 weight halves (e4m3 or e5m2)
             DataType.f16,
             DataType.f16,
             DataType.f16,  # output
@@ -1203,6 +1209,7 @@ def generate_gemm_operations(output_dir, architectures, dual_weight=False):
             op.arch >= 100 and (op.weight_type == e2m1 or op.is_mx_fpx),
             is_mixed_dtype_grouped(op),
             is_dual_weight_grouped(op),
+            op.weight_type if is_dual_weight_grouped(op) else None,
         )
         op_group = op_groups.get(dict_key, [])
         if len(op_group) == 0 or len(op_group[-1]) >= GROUP_SIZE:
@@ -1213,13 +1220,22 @@ def generate_gemm_operations(output_dir, architectures, dual_weight=False):
 
     file_list = []
     for key, value in op_groups.items():
-        gemm_kind, arch, m, block_scale, is_mixed, is_dual_weight = key
+        gemm_kind, arch, m, block_scale, is_mixed, is_dual_weight, dw_weight_type = key
+        dw_suffix = ""
+        if is_dual_weight and dw_weight_type is not None:
+            dw_type_map = {DataType.e4m3: "e4m3", DataType.e5m2: "e5m2"}
+            assert dw_weight_type in dw_type_map, (
+                f"Unknown dual-weight type {dw_weight_type}, expected one of {list(dw_type_map.keys())}"
+            )
+            dw_suffix = f"_DualWeight_{dw_type_map[dw_weight_type]}"
+        elif is_dual_weight:
+            dw_suffix = "_DualWeight"
         for i, op_sub_group in enumerate(value):
             out_file = os.path.join(
                 output_dir,
                 GemmKindNames[gemm_kind],
                 str(arch),
-                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}{'_DualWeight' if is_dual_weight else ''}_group{i}.generated.cu",
+                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}{dw_suffix}_group{i}.generated.cu",
             )
             if is_dual_weight:
                 inl_file = [dual_weight_moe_gemm_inl]

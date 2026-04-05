@@ -81,8 +81,9 @@ struct genericDualWeightMoeGemmKernelLauncher {
   static void call(DualWeightGroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
                    int sm_count_) {
     static_assert(std::is_same_v<T, half>, "Dual-weight MOE only supports FP16 activations");
-    static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3>,
-                  "Dual-weight MOE only supports FP8 E4M3 weights");
+    static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3> ||
+                  std::is_same_v<WeightType, __nv_fp8_e5m2>,
+                  "Dual-weight MOE only supports FP8 E4M3 or E5M2 weights");
     static_assert(arch::kMinComputeCapability >= 80,
                   "Dual-weight MOE only supports tensor-core architectures");
     static_assert(QuantOp == cutlass::WeightOnlyQuantOp::UNDEFINED,
@@ -289,8 +290,9 @@ class DualWeightMoeGemmRunner {
 
   // Type constraints for dual-weight MOE
   static_assert(std::is_same_v<T, half>, "Dual-weight MOE only supports FP16 activations");
-  static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3>,
-                "Dual-weight MOE only supports FP8 E4M3 weights");
+  static_assert(std::is_same_v<WeightType, __nv_fp8_e4m3> ||
+                std::is_same_v<WeightType, __nv_fp8_e5m2>,
+                "Dual-weight MOE only supports FP8 E4M3 or E5M2 weights");
 
   void moeGemmBiasAct(DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       DualWeightTmaWarpSpecializedGroupedGemmInput hopper_inputs);
@@ -512,8 +514,9 @@ bool DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isFusedG
 
 template <typename T, typename WeightType>
 constexpr bool isValidDualWeightHopperTmaSpecialisation() {
-  // Dual-weight Hopper path reconstructs FP16 from two FP8 E4M3 weights.
-  return std::is_same_v<T, half> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+  // Dual-weight Hopper path reconstructs FP16 from two FP8 (E4M3 or E5M2) weights.
+  return std::is_same_v<T, half> &&
+         (std::is_same_v<WeightType, __nv_fp8_e4m3> || std::is_same_v<WeightType, __nv_fp8_e5m2>);
 }
 
 template <typename T, typename WeightType, typename EpilogueTag>
