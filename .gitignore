@@ -1,3 +1,6 @@
+# For reference in the current session only
+dualfp_kernels/
+
 # ci
 flashinfer-whl/
 dist/

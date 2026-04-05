@@ -277,6 +277,12 @@ void dispatchDualWeightMoeGemmTileConfig(
                                    cutlass::gemm::GemmShape<64, 32, 64>,
                                    kKBlockInterleaved>(inputs, sm_count_, stages);
       break;
+    case cutlass_extensions::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
+      dispatchDualWeightGemmStages<T, WeightType, GemmOutputType, arch, EpilogueTag,
+                                   cutlass::gemm::GemmShape<256, 128, 64>,
+                                   cutlass::gemm::GemmShape<64, 64, 64>,
+                                   kKBlockInterleaved>(inputs, sm_count_, stages);
+      break;
     case cutlass_extensions::CutlassTileConfig::Undefined:
       TLLM_THROW("GEMM config undefined.");
       break;
@@ -386,14 +392,7 @@ DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(in
   // They do not work on SM90 for dual-weight kernels.
   if (sm >= 80 && sm < 90) {
     std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
-    // Duplicate ampere configs with kblock_interleaved = true
-    auto interleaved_configs = ampere_configs;
-    for (auto& cfg : interleaved_configs) {
-      cfg.kblock_interleaved = true;
-    }
     std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
-    std::copy(interleaved_configs.begin(), interleaved_configs.end(),
-              std::back_inserter(candidate_configs));
   }
   return candidate_configs;
 }
@@ -417,8 +416,18 @@ DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConf
     return {};
   }
 
-  std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs =
+  std::vector<cutlass_extensions::CutlassGemmConfig> base_configs =
       kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+
+  // Emit both standard and k-block interleaved variants, mirroring the dense runner.
+  std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs;
+  ampere_configs.reserve(base_configs.size() * 2);
+  for (bool kblock_interleaved : {false, true}) {
+    for (auto cfg : base_configs) {
+      cfg.kblock_interleaved = kblock_interleaved;
+      ampere_configs.push_back(cfg);
+    }
+  }
   return ampere_configs;
 }
 

@@ -133,6 +133,14 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
       CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64};
   if (sm >= 75) {
     base_configs.push_back(CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64);
+    if (config_type_param & CutlassGemmConfig::GROUPED_GEMM) {
+      // Small-M tiles help grouped GEMMs (e.g. MoE) where per-expert token counts
+      // are often in the 1..16 range at moderate batch sizes.
+      base_configs.push_back(CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64);
+      base_configs.push_back(CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64);
+      // Large-M tile helps at high batch sizes where per-expert M is large.
+      base_configs.push_back(CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64);
+    }
   }
 
   switch (gemm_type) {
