@@ -144,16 +144,29 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (isWMxfp8AMxfp8Quant()) {
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, true>(mOutputDtype);
     } else if (!mKernelRunner && isFp8Quant()) {
-      if (mActivationDtype == dl_float8_e4m3fn) {
-        mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
-      } else if (mActivationDtype == dl_float16) {
-        mKernelRunner = switch_output_type<half, __nv_fp8_e4m3>(mOutputDtype);
-      }
+      if (mWeightDtype == dl_float8_e5m2) {
+        // e5m2 weights - fp16/bf16 activations (e4m3 act x e5m2 weight not yet supported)
+        if (mActivationDtype == dl_float16) {
+          mKernelRunner = switch_output_type<half, __nv_fp8_e5m2>(mOutputDtype);
+        }
 #ifdef ENABLE_BF16
-      else if (mActivationDtype == dl_bfloat16) {
-        mKernelRunner = switch_output_type<__nv_bfloat16, __nv_fp8_e4m3>(mOutputDtype);
-      }
+        else if (mActivationDtype == dl_bfloat16) {
+          mKernelRunner = switch_output_type<__nv_bfloat16, __nv_fp8_e5m2>(mOutputDtype);
+        }
 #endif
+      } else {
+        // e4m3 weights (original path)
+        if (mActivationDtype == dl_float8_e4m3fn) {
+          mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+        } else if (mActivationDtype == dl_float16) {
+          mKernelRunner = switch_output_type<half, __nv_fp8_e4m3>(mOutputDtype);
+        }
+#ifdef ENABLE_BF16
+        else if (mActivationDtype == dl_bfloat16) {
+          mKernelRunner = switch_output_type<__nv_bfloat16, __nv_fp8_e4m3>(mOutputDtype);
+        }
+#endif
+      }
     }
 #endif
 #ifdef ENABLE_FP4
@@ -1260,8 +1273,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   bool isFp8Quant() const {
-    return (mWeightDtype == dl_float8_e4m3fn) && !mUseDeepSeekFP8BlockScaling &&
-           !mUseMxfp8ActScaling;
+    return (mWeightDtype == dl_float8_e4m3fn || mWeightDtype == dl_float8_e5m2) &&
+           !mUseDeepSeekFP8BlockScaling && !mUseMxfp8ActScaling;
   }
 
   bool isWMxfp8AMxfp8Quant() const {

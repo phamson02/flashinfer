@@ -1029,6 +1029,77 @@ def test_moe_fp8(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8
+    or (
+        torch.cuda.get_device_capability()[0] == 8
+        and torch.cuda.get_device_capability()[1] != 0
+    ),
+    reason="Implemented for SM80 and SM90+",
+)
+def test_single_weight_fused_moe_e5m2(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    # Single-weight cutlass_fused_moe with fp16 activations x e5m2 weights.
+    # e5m2 upper byte shares the FP16 5-bit exponent (bias=15), so no dequant scale.
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    otype = torch.float16
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    x = gen_tensor((batch_size, hidden_size), otype)
+    router_logits = gen_tensor((batch_size, num_experts), otype)
+
+    # Generate FP16 weights, pack into e5m2 dual streams, use only upper for single-weight
+    w31_fp16 = gen_tensor(w31_shape, otype, scale=0.1)
+    w2_fp16 = gen_tensor(w2_shape, otype, scale=0.09)
+
+    fc1_upper, fc1_lower = pack_fp16_to_dual_fp8_e5m2(w31_fp16)
+    fc2_upper, fc2_lower = pack_fp16_to_dual_fp8_e5m2(w2_fp16)
+
+    # SM90+ consumes native (non-pre-shuffled) FP8 layout.
+    if torch.cuda.get_device_capability()[0] >= 9:
+        fc1_upper_mma = fc1_upper.contiguous()
+        fc2_upper_mma = fc2_upper.contiguous()
+    else:
+        fc1_upper_mma = shuffle_fp8_weights_for_mma(fc1_upper.contiguous())
+        fc2_upper_mma = shuffle_fp8_weights_for_mma(fc2_upper.contiguous())
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Reference: dequantize upper e5m2 back to fp16, compute MoE
+    w31_approx = fc1_upper.to(otype)
+    w2_approx = fc2_upper.to(otype)
+    ref_output = moe_reference_swiglu(
+        x, w31_approx, w2_approx, routing_weights,
+        selected_experts.to(torch.int32),
+    )
+
+    flash_output = torch.empty_like(x)
+    _ = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        fc1_upper_mma,
+        fc2_upper_mma,
+        otype,
+        quant_scales=None,
+        output=flash_output,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
     "otype, wtype",
     [(torch.float16, torch.float8_e4m3fn)],

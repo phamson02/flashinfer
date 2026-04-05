@@ -20,6 +20,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <stdexcept>
 
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped_dual_weight.h"
@@ -134,16 +135,22 @@ struct genericDualWeightMoeGemmKernelLauncher {
 
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
+      // Use GemmGrouped::maximum_active_blocks() as the single source of truth for
+      // occupancy. This correctly accounts for the grouped kernel's shared memory
+      // requirements (which include dual-weight storage).
+      int const grouped_occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
+
       if (inputs.occupancy != nullptr) {
-        *inputs.occupancy =
-            tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
+        *inputs.occupancy = grouped_occupancy;
         return;
       }
-      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
-      TLLM_CHECK_WITH_INFO(
-          occupancy > 0,
-          "GPU lacks the shared memory resources to run dual-weight GroupedGEMM kernel");
-      int const threadblock_count = sm_count_ * occupancy;
+      if (grouped_occupancy <= 0) {
+        // Soft error: let the autotuner skip this tile/stage config gracefully
+        // instead of dumping a C++ stack trace via TLLM_CHECK_WITH_INFO.
+        throw std::runtime_error(
+            "GPU lacks the shared memory resources to run dual-weight GroupedGEMM kernel");
+      }
+      int const threadblock_count = sm_count_ * grouped_occupancy;
 
       int const gemm_group_size = inputs.k;
       typename GemmGrouped::Arguments args(
@@ -420,12 +427,32 @@ DualWeightMoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConf
       kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
 
   // Emit both standard and k-block interleaved variants, mirroring the dense runner.
+  // Then filter out configs whose tile/stage combo exceeds the GPU's shared memory
+  // (occupancy == 0). This avoids noisy assertion failures during autotuning.
   std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs;
   ampere_configs.reserve(base_configs.size() * 2);
   for (bool kblock_interleaved : {false, true}) {
     for (auto cfg : base_configs) {
       cfg.kblock_interleaved = kblock_interleaved;
-      ampere_configs.push_back(cfg);
+
+      // Query occupancy through the same dispatch chain used at runtime.
+      // A zero-occupancy config can never execute on this GPU.
+      DualWeightGroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> probe{};
+      probe.use_fused_moe = false;
+      probe.gemm_config = cfg;
+      int occ = 0;
+      probe.occupancy = &occ;
+      try {
+        dispatchDualWeightMoeGemmToCutlass<T, WeightType, OutputType,
+                                           cutlass::arch::Sm80,
+                                           cutlass_extensions::EpilogueOpDefault>(probe, /*sm_count=*/1);
+      } catch (...) {
+        // Dispatch can throw for unsupported tile configs — treat as zero occupancy.
+        occ = 0;
+      }
+      if (occ > 0) {
+        ampere_configs.push_back(cfg);
+      }
     }
   }
   return ampere_configs;

@@ -15,5 +15,6 @@
 namespace tensorrt_llm::kernels::cutlass_kernels {
 #ifdef ENABLE_FP8
 template class MoeGemmRunner<half, __nv_fp8_e4m3, half>;
+template class MoeGemmRunner<half, __nv_fp8_e5m2, half>;
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

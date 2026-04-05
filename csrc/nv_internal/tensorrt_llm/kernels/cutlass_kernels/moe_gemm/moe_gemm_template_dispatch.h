@@ -99,11 +99,15 @@ struct genericMoeGemmKernelLauncher {
         (cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value ||
          cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value) &&
         (cutlass::platform::is_same<T, half>::value ||
-         cutlass::platform::is_same<T, __nv_bfloat16>::value);
+         cutlass::platform::is_same<T, __nv_bfloat16>::value ||
+         cutlass::platform::is_same<T, __nv_fp8_e4m3>::value ||
+         cutlass::platform::is_same<T, __nv_fp8_e5m2>::value);
 #elif defined(ENABLE_FP8)
         (cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value ||
          cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value) &&
-        cutlass::platform::is_same<T, half>::value;
+        (cutlass::platform::is_same<T, half>::value ||
+         cutlass::platform::is_same<T, __nv_fp8_e4m3>::value ||
+         cutlass::platform::is_same<T, __nv_fp8_e5m2>::value);
 #else
         false;
 #endif
@@ -787,6 +791,10 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
         static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3> &&
                           !std::is_same_v<OutputType, __nv_fp8_e5m2>,
                       "FP8 GEMM Output not supported");
+        // Mixed FP8 types (e.g. e4m3 act x e5m2 weight) require SM90+ TMA kernels.
+        constexpr bool is_mixed_fp8 = use_fp8_activation && use_fp8_weights &&
+                                      !std::is_same_v<T, WeightType>;
+        if constexpr (!is_mixed_fp8) {
 #endif
 
         TLLM_CHECK_WITH_INFO(sm_ == 89,
@@ -794,6 +802,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm89, EpilogueTag>(
             inputs, multi_processor_count_);
+#if defined(ENABLE_FP8)
+        } else {
+          TLLM_THROW("Mixed FP8 types (e4m3 x e5m2) are only supported on SM90+");
+        }
+#endif
       } else {
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm80, EpilogueTag>(
@@ -804,7 +817,12 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
     }
   } else if (sm_ >= 90) {
     // For SM120+ pure FP8 MoE (not FP8 x FP4), redirect to SM89 (Ada) FP8 kernel implementations.
-    if constexpr (use_fp8 && !use_wfp4afp8) {
+    // Mixed FP8 types (e.g. e4m3 x e5m2) use SM90+ TMA kernels, not the SM89 redirect.
+    if constexpr (use_fp8 && !use_wfp4afp8
+#if defined(ENABLE_FP8)
+                  && !(use_fp8_activation && use_fp8_weights && !std::is_same_v<T, WeightType>)
+#endif
+    ) {
       if (sm_ >= 120) {
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm89, EpilogueTag>(
@@ -925,9 +943,19 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
                            "Using SM %d configuration for SM80 fallback implementation",
                            inputs.gemm_config.sm_version);
       if constexpr (use_fp8) {
+#if defined(ENABLE_FP8)
+        constexpr bool is_mixed_fp8_fallback = use_fp8_activation && use_fp8_weights &&
+                                               !std::is_same_v<T, WeightType>;
+        if constexpr (!is_mixed_fp8_fallback) {
+#endif
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm89, EpilogueTag>(
             inputs, multi_processor_count_);
+#if defined(ENABLE_FP8)
+        } else {
+          TLLM_THROW("Mixed FP8 types (e4m3 x e5m2) fallback to SM89 is not supported");
+        }
+#endif
       } else {
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm80, EpilogueTag>(
