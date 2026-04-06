@@ -250,6 +250,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
+    // E4M3 activation × E5M2 weight (mixed FP8)
+    if (!mKernelRunner && mWeightDtype == dl_float8_e5m2) {
+      if (mActivationDtype == dl_float8_e4m3fn) {
+        mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e5m2>(mOutputDtype);
+      }
+    }
 #endif
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)

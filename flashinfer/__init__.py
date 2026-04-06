@@ -105,6 +105,9 @@ from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import dual_weight_mm as dual_weight_mm
 from .gemm import dual_weight_mm_e5m2 as dual_weight_mm_e5m2
 from .gemm import dual_weight_mm_e5m2_trunc as dual_weight_mm_e5m2_trunc
+from .gemm import dual_weight_mm_sm90 as dual_weight_mm_sm90
+from .gemm import dual_weight_mm_sm90_e5m2 as dual_weight_mm_sm90_e5m2
+from .gemm import dual_weight_mm_sm90_e5m2_trunc as dual_weight_mm_sm90_e5m2_trunc
 from .gemm import prepare_mixed_mm_weights as prepare_mixed_mm_weights
 from .gemm import mixed_mm_e4m3 as mixed_mm_e4m3
 from .gemm import mixed_mm_e5m2 as mixed_mm_e5m2

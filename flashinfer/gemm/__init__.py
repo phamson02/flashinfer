@@ -11,6 +11,9 @@ from .gemm_base import prepare_dual_weight_mm_weights as prepare_dual_weight_mm_
 from .gemm_base import dual_weight_mm_e5m2 as dual_weight_mm_e5m2
 from .gemm_base import prepare_dual_weight_mm_weights_e5m2 as prepare_dual_weight_mm_weights_e5m2
 from .gemm_base import dual_weight_mm_e5m2_trunc as dual_weight_mm_e5m2_trunc
+from .gemm_base import dual_weight_mm_sm90 as dual_weight_mm_sm90
+from .gemm_base import dual_weight_mm_sm90_e5m2 as dual_weight_mm_sm90_e5m2
+from .gemm_base import dual_weight_mm_sm90_e5m2_trunc as dual_weight_mm_sm90_e5m2_trunc
 from .gemm_base import prepare_mixed_mm_weights as prepare_mixed_mm_weights
 from .gemm_base import mixed_mm_e4m3 as mixed_mm_e4m3
 from .gemm_base import mixed_mm_e5m2 as mixed_mm_e5m2
@@ -67,6 +70,9 @@ __all__ = [
     "dual_weight_mm_e5m2",
     "prepare_dual_weight_mm_weights_e5m2",
     "dual_weight_mm_e5m2_trunc",
+    "dual_weight_mm_sm90",
+    "dual_weight_mm_sm90_e5m2",
+    "dual_weight_mm_sm90_e5m2_trunc",
     "prepare_mixed_mm_weights",
     "mixed_mm_e4m3",
     "mixed_mm_e5m2",

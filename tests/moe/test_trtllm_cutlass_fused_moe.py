@@ -1030,6 +1030,104 @@ def test_moe_fp8(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 9,
+    reason="Mixed FP8 (E4M3 x E5M2) requires SM90+",
+)
+def test_moe_fp8_e4m3_x_e5m2(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """E4M3 activation x E5M2 weight single-weight fused MOE."""
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    otype = torch.float16
+    wtype_e5m2 = torch.float8_e5m2
+    input_shape = (batch_size, hidden_size)
+    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+    x = cast_to_representable(gen_tensor(input_shape, otype))
+    router_logits = gen_tensor((batch_size, num_experts), otype)
+
+    # Create E5M2 weight tensors with per-tensor E4M3 quantization for activation
+    e5m2_max = torch.finfo(wtype_e5m2).max
+    w31_weight = gen_tensor(w31_shape, otype, wtype_e5m2)
+    w2_weight = gen_tensor(w2_shape, otype, wtype_e5m2)
+    w31_scales = torch.empty(num_experts, 2, dtype=otype).cuda()
+    w2_scales = torch.empty(num_experts, 1, dtype=otype).cuda()
+
+    w31_dequantized = gen_tensor(w31_shape, otype)
+    w2_dequantized = gen_tensor(w2_shape, otype)
+    for expert_id in range(num_experts):
+        w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
+        w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
+
+        # Quantize weights to E5M2
+        w31_amax = w31.abs().max().float()
+        w31_scale = w31_amax / e5m2_max
+        w31_quant = (w31.float() / w31_scale).clamp(-e5m2_max, e5m2_max).to(wtype_e5m2)
+
+        w2_amax = w2.abs().max().float()
+        w2_scale = w2_amax / e5m2_max
+        w2_quant = (w2.float() / w2_scale).clamp(-e5m2_max, e5m2_max).to(wtype_e5m2)
+
+        w31_weight.data[expert_id].copy_(w31_quant)
+        w2_weight.data[expert_id].copy_(w2_quant)
+        w31_scales.data[expert_id].copy_(w31_scale.view(1).expand(2))
+        w2_scales.data[expert_id].copy_(w2_scale.view(1))
+        w31_dequantized.data[expert_id].copy_(
+            torch.mul(w31_quant.to(dtype=otype), w31_scale)
+        )
+        w2_dequantized.data[expert_id].copy_(
+            torch.mul(w2_quant.to(dtype=otype), w2_scale)
+        )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_dequantized,
+        w2_dequantized,
+        selected_experts,
+        routing_weights,
+    )
+    flash_output = torch.empty_like(ref_output)
+    # Quantize activation to E4M3
+    _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
+    x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
+    hidden_states_scale = torch.tensor(hidden_states_scale[0]).cuda()
+    quant_scales = [
+        torch.squeeze(w1_scales * hidden_states_scale).float(),
+        torch.tensor(1.0).cuda(),
+        torch.squeeze(1.0 * w2_scales).float(),
+        hidden_states_scale,
+    ]
+
+    _ = fused_moe.cutlass_fused_moe(
+        x_quant,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        otype,
+        quant_scales=quant_scales,
+        output=flash_output,
+    )
+    # E5M2 weights have only 2 mantissa bits — use cosine similarity for correctness check.
+    cos_sim = F.cosine_similarity(
+        ref_output.reshape(-1).float(), flash_output.reshape(-1).float(), dim=0
+    )
+    assert cos_sim > 0.99, f"cos_sim={cos_sim:.6f}"
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 8
     or (
         torch.cuda.get_device_capability()[0] == 8

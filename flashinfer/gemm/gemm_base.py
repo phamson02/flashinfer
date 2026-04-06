@@ -380,6 +380,130 @@ def get_dual_weight_gemm_sm80_module():
     )
 
 
+@functools.cache
+def get_dual_weight_gemm_sm90_module():
+    from ..jit.gemm import gen_dual_weight_gemm_sm90_module
+
+    module = gen_dual_weight_gemm_sm90_module().build_and_load()
+
+    @register_custom_op("flashinfer::dual_weight_mm_sm90", mutates_args=("out",))
+    def dual_weight_mm_sm90_op(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm90(a, w_upper, w_lower, out, workspace_buffer, tactic)
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm90")
+    def _fake_dual_weight_mm_sm90(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    @register_custom_op("flashinfer::dual_weight_mm_sm90_e5m2", mutates_args=("out",))
+    def dual_weight_mm_sm90_e5m2_op(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm90_e5m2(a, w_upper, w_lower, out, workspace_buffer, tactic)
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm90_e5m2")
+    def _fake_dual_weight_mm_sm90_e5m2(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    @register_custom_op(
+        "flashinfer::dual_weight_mm_sm90_e5m2_trunc", mutates_args=("out",)
+    )
+    def dual_weight_mm_sm90_e5m2_trunc_op(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        module.dual_weight_mm_sm90_e5m2_trunc(
+            a, w_upper, w_lower, out, workspace_buffer, tactic
+        )
+
+    @register_fake_op("flashinfer::dual_weight_mm_sm90_e5m2_trunc")
+    def _fake_dual_weight_mm_sm90_e5m2_trunc(
+        a: torch.Tensor,
+        w_upper: torch.Tensor,
+        w_lower: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        tactic: int,
+    ) -> None:
+        pass
+
+    def dual_weight_mm_sm90_runner():
+        class Sm90DualWeightMmRunner(TunableRunner):
+            def get_valid_tactics(self, inputs, profile):
+                return list(range(module.dual_weight_mm_sm90_tactic_num()))
+
+            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm90_op(a, w_upper, w_lower, out, workspace_buffer, tactic)
+                return out
+
+        return Sm90DualWeightMmRunner()
+
+    def dual_weight_mm_sm90_e5m2_runner():
+        class Sm90DualWeightMmE5M2Runner(TunableRunner):
+            def get_valid_tactics(self, inputs, profile):
+                return list(range(module.dual_weight_mm_sm90_e5m2_tactic_num()))
+
+            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm90_e5m2_op(a, w_upper, w_lower, out, workspace_buffer, tactic)
+                return out
+
+        return Sm90DualWeightMmE5M2Runner()
+
+    def dual_weight_mm_sm90_e5m2_trunc_runner():
+        class Sm90DualWeightMmE5M2TruncRunner(TunableRunner):
+            def get_valid_tactics(self, inputs, profile):
+                return list(range(module.dual_weight_mm_sm90_e5m2_trunc_tactic_num()))
+
+            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                a, w_upper, w_lower, out, workspace_buffer = inputs
+                dual_weight_mm_sm90_e5m2_trunc_op(
+                    a, w_upper, w_lower, out, workspace_buffer, tactic
+                )
+                return out
+
+        return Sm90DualWeightMmE5M2TruncRunner()
+
+    return SimpleNamespace(
+        dual_weight_mm_sm90_runner=dual_weight_mm_sm90_runner,
+        dual_weight_mm_sm90=dual_weight_mm_sm90_op,
+        dual_weight_mm_sm90_e5m2_runner=dual_weight_mm_sm90_e5m2_runner,
+        dual_weight_mm_sm90_e5m2=dual_weight_mm_sm90_e5m2_op,
+        dual_weight_mm_sm90_e5m2_trunc_runner=dual_weight_mm_sm90_e5m2_trunc_runner,
+        dual_weight_mm_sm90_e5m2_trunc=dual_weight_mm_sm90_e5m2_trunc_op,
+    )
+
+
 def _check_row_major_matrix(x: torch.Tensor, name: str) -> None:
     if x.ndim != 2:
         raise ValueError(f"{name} must be a 2D tensor, got shape {tuple(x.shape)}.")
@@ -844,6 +968,133 @@ def dual_weight_mm_e5m2_trunc(
         "dual_weight_mm_e5m2_trunc_sm80",
         runners,
         _SM80_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SM90 Dual-Weight GEMM: NestedFP dual FP8 × FP16 → FP16
+# Uses SM90 TMA + GMMA with in-kernel reconstruction.
+# ---------------------------------------------------------------------------
+
+_SM90_GEMM_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (-2,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            3,
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+@flashinfer_api
+def dual_weight_mm_sm90(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM90 dual-weight matrix multiplication (E4M3 encoding).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input activation, shape ``(m, k)``, float16, row-major.
+    w_upper : torch.Tensor
+        Upper dual-weight, shape ``(k, n)``, fp8-e4m3, column-major.
+    w_lower : torch.Tensor
+        Lower dual-weight, shape ``(k, n)``, fp8-e4m3, column-major.
+    out : Optional[torch.Tensor]
+        Output tensor, shape ``(m, n)``, float16, row-major.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor.
+    """
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]), device=a.device, dtype=torch.float16
+        )
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_sm90_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_dual_weight_gemm_sm90_module().dual_weight_mm_sm90_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_sm90",
+        runners,
+        _SM90_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+@flashinfer_api
+def dual_weight_mm_sm90_e5m2(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM90 dual-weight matrix multiplication (E5M2 RTN encoding)."""
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]), device=a.device, dtype=torch.float16
+        )
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_sm90_e5m2_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [get_dual_weight_gemm_sm90_module().dual_weight_mm_sm90_e5m2_runner()]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_sm90_e5m2",
+        runners,
+        _SM90_GEMM_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+@flashinfer_api
+def dual_weight_mm_sm90_e5m2_trunc(
+    a: torch.Tensor,
+    w_upper: torch.Tensor,
+    w_lower: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SM90 dual-weight matrix multiplication (E5M2 truncation encoding)."""
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], w_upper.shape[1]), device=a.device, dtype=torch.float16
+        )
+    workspace_buffer = _get_cache_buf(
+        "dual_weight_mm_sm90_e5m2_trunc_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    runners = [
+        get_dual_weight_gemm_sm90_module().dual_weight_mm_sm90_e5m2_trunc_runner()
+    ]
+    tuner = AutoTuner.get()
+    inputs = [a, w_upper, w_lower, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "dual_weight_mm_sm90_e5m2_trunc",
+        runners,
+        _SM90_GEMM_TUNING_CONFIG,
         inputs,
     )
     runner(inputs=inputs, tactic=tactic)

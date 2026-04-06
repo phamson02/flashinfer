@@ -7,6 +7,9 @@ from flashinfer import (
     dual_weight_mm,
     dual_weight_mm_e5m2,
     dual_weight_mm_e5m2_trunc,
+    dual_weight_mm_sm90,
+    dual_weight_mm_sm90_e5m2,
+    dual_weight_mm_sm90_e5m2_trunc,
     prepare_dual_weight_mm_weights,
     prepare_dual_weight_mm_weights_e5m2,
 )
@@ -210,6 +213,78 @@ def test_dual_weight_mm_e5m2_trunc(m: int, n: int, k: int) -> None:
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+# --- SM90 tests ---
+
+
+@pytest.mark.parametrize("m, n, k", [(32, 128, 128), (63, 256, 256)])
+def test_dual_weight_mm_sm90(m: int, n: int, k: int) -> None:
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("dual_weight_mm_sm90 requires SM90+.")
+
+    torch.manual_seed(42)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    weight_fp16 = torch.randn((n, k), device="cuda", dtype=torch.float16)
+
+    w_upper, w_lower = pack_fp16_to_dual_fp8(weight_fp16, column_major=True)
+
+    reconstructed_weight = reconstruct_fp16_from_dual_fp8(*pack_fp16_to_dual_fp8(weight_fp16))
+    reference = F.linear(a.float(), reconstructed_weight.float()).to(torch.float16)
+
+    with autotune():
+        out = dual_weight_mm_sm90(a, w_upper, w_lower)
+
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99, f"cos_sim={cos_sim:.6f}"
+
+
+@pytest.mark.parametrize("m, n, k", [(32, 128, 128), (63, 256, 256)])
+def test_dual_weight_mm_sm90_e5m2(m: int, n: int, k: int) -> None:
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("dual_weight_mm_sm90_e5m2 requires SM90+.")
+
+    torch.manual_seed(42)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    weight_fp16 = _make_finite_bf16_cast_fp16_weights(n * k, device="cuda").reshape(n, k)
+
+    w_upper, w_lower = pack_fp16_to_dual_fp8_e5m2(weight_fp16, column_major=True)
+
+    w_upper_row, w_lower_row = pack_fp16_to_dual_fp8_e5m2(weight_fp16)
+    reconstructed_weight = reconstruct_fp16_from_dual_fp8_e5m2(w_upper_row, w_lower_row)
+    reference = F.linear(a.float(), reconstructed_weight.float()).to(torch.float16)
+
+    with autotune():
+        out = dual_weight_mm_sm90_e5m2(a, w_upper, w_lower)
+
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99, f"cos_sim={cos_sim:.6f}"
+
+
+@pytest.mark.parametrize("m, n, k", [(32, 128, 128), (63, 256, 256)])
+@pytest.mark.skip(reason="SM90 standalone E5M2 trunc kernel not yet implemented — uses E4M3 reconstruction")
+def test_dual_weight_mm_sm90_e5m2_trunc(m: int, n: int, k: int) -> None:
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("dual_weight_mm_sm90_e5m2_trunc requires SM90+.")
+
+    torch.manual_seed(42)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16) * 0.1
+    weight_fp16 = torch.randn((n, k), device="cuda", dtype=torch.float16) * 0.1
+
+    w_upper, w_lower = pack_fp16_to_dual_fp8_e5m2_trunc(weight_fp16, column_major=True)
+
+    w_upper_row, w_lower_row = pack_fp16_to_dual_fp8_e5m2_trunc(weight_fp16)
+    reconstructed_weight = reconstruct_fp16_from_dual_fp8_e5m2_trunc(w_upper_row, w_lower_row)
+    reference = F.linear(a.float(), reconstructed_weight.float()).to(torch.float16)
+
+    with autotune():
+        out = dual_weight_mm_sm90_e5m2_trunc(a, w_upper, w_lower)
+
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99, f"cos_sim={cos_sim:.6f}"
 
 
 if __name__ == "__main__":

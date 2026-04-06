@@ -92,6 +92,20 @@ def gen_dual_weight_gemm_sm80_module() -> JitSpec:
     )
 
 
+def gen_dual_weight_gemm_sm90_module() -> JitSpec:
+    return gen_jit_spec(
+        "dual_weight_gemm_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "dual_weight_gemm_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags
+        + [
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+            "-DENABLE_FP8",
+        ],
+    )
+
+
 def gen_mixed_mm_sm80_module() -> JitSpec:
     _nv = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     return gen_jit_spec(

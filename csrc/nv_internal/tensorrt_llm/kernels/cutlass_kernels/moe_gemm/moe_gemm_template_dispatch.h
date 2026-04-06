@@ -128,7 +128,16 @@ struct genericMoeGemmKernelLauncher {
     using CutlassGemmOutputType =
         typename cutlass_kernels::TllmToCutlassTypeAdapter<GemmOutputType>::type;
     using CutlassWeightType = typename cutlass_kernels::TllmToCutlassTypeAdapter<WeightType>::type;
-    if (!inputs.use_fused_moe) {
+    // Mixed FP8 types (e.g. E4M3 activation × E5M2 weight) are only supported on SM90+ (TMA path).
+    // Skip the SM80 grouped GEMM path for mixed FP8 since MixedGemmArchTraits doesn't support it.
+    constexpr bool IsMixedFP8Types = !cutlass::platform::is_same<T, WeightType>::value &&
+        (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value || cutlass::platform::is_same<T, __nv_fp8_e5m2>::value) &&
+        (cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value || cutlass::platform::is_same<WeightType, __nv_fp8_e5m2>::value);
+
+    if constexpr (IsMixedFP8Types) {
+      // Mixed FP8 is SM90+ only — this SM80 path should never be reached at runtime.
+      return;
+    } else if (!inputs.use_fused_moe) {
       // We need separate config for each architecture since we will target different tensorcore
       // instructions. For float, we do not target TCs.
       using MixedGemmArchTraits =
@@ -596,8 +605,13 @@ std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpecializedConfigs(
     int sm, bool supports_finalize_fusion) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+  // Mixed FP8 (E4M3×E5M2) uses same-width tiles, not the WEIGHT_ONLY tile set.
+  static constexpr bool is_mixed_fp8_same_width =
+      !std::is_same_v<T, WeightType> && sizeof(T) == sizeof(WeightType) &&
+      use_fp8_activation && use_fp8_weights;
   static constexpr auto weight_only_flag =
-      std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
+      (std::is_same<T, WeightType>::value || is_mixed_fp8_same_width)
+          ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag =
       std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
   int const max_split_k = 1;

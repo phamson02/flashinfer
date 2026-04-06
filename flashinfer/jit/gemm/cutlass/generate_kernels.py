@@ -286,10 +286,16 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 #endif"""
             return instantiation
 
-        if operation.act_type != operation.weight_type and (
-            operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
+        is_mixed_fp8 = (
+            operation.act_type == DataType.e4m3
+            and operation.weight_type == DataType.e5m2
+        )
+        if (
+            operation.act_type != operation.weight_type
+            and (operation.act_type != DataType.e4m3 or operation.weight_type != e2m1)
+            and not is_mixed_fp8
         ):
-            # Mixed MoE GEMM
+            # Mixed MoE GEMM (different bit-width types, e.g. FP16×FP8)
             weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
@@ -667,32 +673,40 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         epi_schedule = None
 
         otypes = [dtype]
+        # For FP8 same-type (e4m3×e4m3), output is FP16/BF16.
+        # Also generate mixed FP8 (e4m3×e5m2) with same output types.
+        weight_types_for_dtype = [(dtype, otypes)]
         if dtype == DataType.e4m3:
-            otypes = [DataType.f16, DataType.bf16]
+            fp8_otypes = [DataType.f16, DataType.bf16]
+            weight_types_for_dtype = [
+                (DataType.e4m3, fp8_otypes),
+                (DataType.e5m2, fp8_otypes),  # E4M3 activation × E5M2 weight
+            ]
 
-        for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                dtype,
-                dtype,
-                dtype,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                swap_ab=swap_ab,
-            )
+        for wtype, otypes_for_wtype in weight_types_for_dtype:
+            for otype in otypes_for_wtype:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    wtype,
+                    dtype,
+                    dtype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    swap_ab=swap_ab,
+                )
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 
@@ -1180,11 +1194,14 @@ def generate_gemm_operations(output_dir, architectures, dual_weight=False):
             return False
         if getattr(op, "dual_weight", False):
             return False
-        # Only w4a8fp8 and not wfp4afp8
+        # Mixed-width types (e.g. FP16×FP8, FP8×FP4) use a different launcher.
+        # Same-width mixed FP8 (E4M3×E5M2) uses the regular FP8 launcher.
+        is_mixed_fp8 = op.act_type == DataType.e4m3 and op.weight_type == DataType.e5m2
         return (
             (op.act_type != op.weight_type)
             and (op.gemm_kind == GemmKind.Grouped)
             and (op.act_type != DataType.e4m3 or op.weight_type != e2m1)
+            and not is_mixed_fp8
         )
 
     def is_dual_weight_grouped(op):

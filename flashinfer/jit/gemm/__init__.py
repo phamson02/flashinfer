@@ -16,6 +16,7 @@ limitations under the License.
 
 from .core import (
     gen_dual_weight_gemm_sm80_module,
+    gen_dual_weight_gemm_sm90_module,
     gen_mixed_mm_sm80_module,
     gen_gemm_module,
     gen_gemm_sm100_module_cutlass_fp4,
@@ -36,6 +37,7 @@ from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
 
 __all__ = [
     "gen_dual_weight_gemm_sm80_module",
+    "gen_dual_weight_gemm_sm90_module",
     "gen_mixed_mm_sm80_module",
     "gen_gemm_module",
     "gen_gemm_sm100_module_cutlass_fp4",
