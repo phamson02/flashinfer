@@ -117,10 +117,16 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidAmpereMOESpecialisation() {
+  // Mixed FP8 (E4M3×E5M2) is SM90+ only — no Ampere implementation.
+  constexpr bool is_mixed_fp8 =
+      !std::is_same_v<T, WeightType> &&
+      (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
+      (std::is_same_v<WeightType, __nv_fp8_e4m3> || std::is_same_v<WeightType, __nv_fp8_e5m2>);
+  if constexpr (is_mixed_fp8) return false;
 #ifdef ENABLE_FP4
   return !std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
-  return true;  // Default to true
+  return true;
 #endif
 }
 

@@ -588,8 +588,11 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfi
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
+  // Mixed FP8 (E4M3×E5M2) has no Ampere implementation — SM90+ TMA only.
+  constexpr bool is_mixed_fp8 = !std::is_same_v<T, WeightType> && sizeof(T) == sizeof(WeightType)
+      && use_fp8_activation && use_fp8_weights;
   if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
-      (use_w4afp8 && sm != 89) || use_wfp4a16) {
+      (use_w4afp8 && sm != 89) || use_wfp4a16 || is_mixed_fp8) {
     return {};
   }
 
@@ -945,7 +948,13 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
     // Do Ampere case instead
     if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<
                       T, WeightType, EpilogueTag>()) {
-      TLLM_CHECK_WITH_INFO(!use_fp8, "No fallback FP8 implementation available");
+      // Mixed FP8 (E4M3×E5M2) has no Ampere fallback — SM90+ TMA path only.
+      constexpr bool is_mixed_fp8 = !std::is_same_v<T, WeightType> && sizeof(T) == sizeof(WeightType)
+          && use_fp8_activation && use_fp8_weights;
+      TLLM_CHECK_WITH_INFO(!use_fp8 || is_mixed_fp8, "No fallback FP8 implementation available");
+      if constexpr (is_mixed_fp8) {
+        return;
+      }
       TLLM_CHECK_WITH_INFO(use_w4afp8 || !hopper_inputs.isValid(),
                            "Non-specialized Hopper implementation is being rerouted to fallback "
                            "implementation so input "
