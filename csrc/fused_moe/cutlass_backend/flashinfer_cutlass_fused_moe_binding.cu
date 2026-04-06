@@ -65,6 +65,8 @@ class DtypeUtils {
         return nvinfer1::DataType::kBOOL;
       case float8_e4m3fn_code:
         return nvinfer1::DataType::kFP8;
+      case float8_e5m2_code:
+        return nvinfer1::DataType::kFP8;
       case bfloat16_code:
         return nvinfer1::DataType::kBF16;
       case encode_dlpack_dtype(dl_uint4x2):
