@@ -392,10 +392,20 @@ void dispatchMoeGemmToCutlass(
                          cutlass::gemm::GemmShape<64, 128, 64>,
                          cutlass::gemm::GemmShape<32, 64, 64>>(inputs, sm_count_);
       break;
+    case cutlass_extensions::CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
+      dispatchGemmConfig<T, WeightType, GemmOutputType, arch, EpilogueTag,
+                         cutlass::gemm::GemmShape<64, 128, 64>,
+                         cutlass::gemm::GemmShape<64, 32, 64>>(inputs, sm_count_);
+      break;
     case cutlass_extensions::CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
       dispatchGemmConfig<T, WeightType, GemmOutputType, arch, EpilogueTag,
                          cutlass::gemm::GemmShape<128, 128, 64>,
                          cutlass::gemm::GemmShape<64, 32, 64>>(inputs, sm_count_);
+      break;
+    case cutlass_extensions::CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
+      dispatchGemmConfig<T, WeightType, GemmOutputType, arch, EpilogueTag,
+                         cutlass::gemm::GemmShape<128, 128, 64>,
+                         cutlass::gemm::GemmShape<128, 32, 64>>(inputs, sm_count_);
       break;
     case cutlass_extensions::CutlassTileConfig::Undefined:
       TLLM_THROW("GEMM config undefined.");
@@ -591,8 +601,15 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfi
   // Mixed FP8 (E4M3×E5M2) has no Ampere implementation — SM90+ TMA only.
   constexpr bool is_mixed_fp8 = !std::is_same_v<T, WeightType> && sizeof(T) == sizeof(WeightType)
       && use_fp8_activation && use_fp8_weights;
+  // Same-type GEMM on SM90+: the Ampere fallback's same-type tensorop dispatch
+  // has fewer tile configs than get_candidate_configs enumerates (missing
+  // CtaShape256x128x64 and others that lack template instantiations).
+  // The TMA warp-specialized path is always preferred on Hopper, so skip
+  // Ampere entirely for same-type to avoid invalid-tactic warnings.
+  constexpr bool is_same_type = std::is_same_v<T, WeightType>;
   if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
-      (use_w4afp8 && sm != 89) || use_wfp4a16 || is_mixed_fp8) {
+      (use_w4afp8 && sm != 89) || use_wfp4a16 || is_mixed_fp8 ||
+      (is_same_type && sm >= 90)) {
     return {};
   }
 
